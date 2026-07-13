@@ -4,10 +4,12 @@ Step 1: Download the Kaggle Chest X-Ray Pneumonia dataset.
 Usage:
     python scripts/01_download_data.py
 
-Credentials are loaded from .env file in the project root.
+Credentials are loaded from .env file in the project root, environment variables,
+or ~/.kaggle/kaggle.json.
 """
 
 import os
+import shutil
 from pathlib import Path
 
 # Load .env file
@@ -19,30 +21,55 @@ if env_path.exists():
             key, value = line.split("=", 1)
             os.environ[key.strip()] = value.strip()
 
-import opendatasets as od
+try:
+    from kaggle.api.kaggle_api_extended import KaggleApi
+except ImportError as exc:
+    raise SystemExit(
+        "Missing dependency: kaggle\n"
+        "Install it with: python -m pip install -r requirements.txt"
+    ) from exc
 
-DATA_DIR = Path("data/raw")
+DATA_DIR = Path("data/raw").resolve()
+DOWNLOAD_DIR = DATA_DIR / "kaggle_download"
+FINAL_DIR = DATA_DIR / "chest_xray"
+DATASET = "paultimothymooney/chest-xray-pneumonia"
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-DATASET_URL = "https://www.kaggle.com/datasets/paultimothymooney/chest-xray-pneumonia"
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 print("Downloading Chest X-Ray Pneumonia dataset from Kaggle...")
-od.download(DATASET_URL, data_dir=str(DATA_DIR))
+api = KaggleApi()
+api.authenticate()
+api.dataset_download_files(DATASET, path=str(DOWNLOAD_DIR), unzip=True, quiet=False)
 
-expected_dir = DATA_DIR / "chest-xray-pneumonia" / "chest_xray"
-if not expected_dir.exists():
-    expected_dir = DATA_DIR / "chest-xray-pneumonia"
+candidate_dirs = [
+    DOWNLOAD_DIR / "chest_xray",
+    DOWNLOAD_DIR / "chest-xray-pneumonia" / "chest_xray",
+    DOWNLOAD_DIR / "chest-xray-pneumonia",
+]
+
+source_dir = next((path for path in candidate_dirs if path.exists()), None)
+if source_dir is None:
+    raise SystemExit(
+        f"Download finished, but the expected chest_xray folder was not found in {DOWNLOAD_DIR}"
+    )
+
+if FINAL_DIR.exists():
+    print(f"Dataset already exists at: {FINAL_DIR}")
+else:
+    shutil.move(str(source_dir), str(FINAL_DIR))
+    print(f"Moved dataset to: {FINAL_DIR}")
 
 for split in ["train", "val", "test"]:
     for cls in ["NORMAL", "PNEUMONIA"]:
-        cls_dir = expected_dir / split / cls
+        cls_dir = FINAL_DIR / split / cls
         if cls_dir.exists():
             count = len(list(cls_dir.glob("*.jpeg")))
             print(f"  {split}/{cls}: {count} images")
         else:
-            print(f"  {split}/{cls}: NOT FOUND — check the extracted folder structure")
+            print(f"  {split}/{cls}: NOT FOUND - check the extracted folder structure")
 
-print(f"\nDataset saved to: {expected_dir}")
+print(f"\nDataset saved to: {FINAL_DIR}")
 print("If the folder structure looks wrong, manually move so it looks like:")
 print("  data/raw/chest_xray/train/NORMAL/")
 print("  data/raw/chest_xray/train/PNEUMONIA/")
