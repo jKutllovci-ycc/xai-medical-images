@@ -19,8 +19,13 @@ python scripts/03_train_classifier.py
 # 5. Evaluate on test set
 python scripts/04_evaluate.py
 
-# 6. Generate Grad-CAM explanations
+# 6. Generate Grad-CAM explanations and diagnostics
 python scripts/05_gradcam.py
+
+# Optional: explain predicted classes, or compare CAM layers
+python scripts/05_gradcam.py --target-class predicted
+python scripts/05_gradcam.py --target-layer layer3
+python scripts/05_gradcam.py --no-comparison
 
 # 7. View all results in the notebook
 jupyter notebook notebooks/results.ipynb
