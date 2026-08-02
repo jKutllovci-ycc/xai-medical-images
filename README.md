@@ -27,7 +27,14 @@ python scripts/05_gradcam.py --target-class predicted
 python scripts/05_gradcam.py --target-layer layer3
 python scripts/05_gradcam.py --no-comparison
 
-# 7. View all results in the notebook
+# 7. Generate counterfactual explanations
+python scripts/06_counterfactual.py
+
+# Optional: more steps for harder cases, or more examples
+python scripts/06_counterfactual.py --steps 800 --max-per-class 8
+python scripts/06_counterfactual.py --lr 0.015 --l1-weight 0.005
+
+# 8. View all results in the notebook
 jupyter notebook notebooks/results.ipynb
 ```
 
@@ -40,7 +47,8 @@ xai-medical-images/
 │   ├── 02_preprocess.py            # Data exploration & stats
 │   ├── 03_train_classifier.py      # Train ResNet-18 classifier
 │   ├── 04_evaluate.py              # Test set evaluation
-│   └── 05_gradcam.py               # Grad-CAM heatmap explanations
+│   ├── 05_gradcam.py               # Grad-CAM heatmap explanations
+│   └── 06_counterfactual.py        # Counterfactual explanations
 ├── notebooks/
 │   └── results.ipynb               # View all findings & plots
 ├── data/raw/chest_xray/            # Dataset (train/val/test)
@@ -50,8 +58,8 @@ xai-medical-images/
 │   └── experiment_log.md           # Manual experiment notes
 └── outputs/
     ├── gradcam/                    # Grad-CAM heatmap images
-    ├── counterfactuals/            # (future) Generated counterfactuals
-    └── comparisons/                # (future) Side-by-side comparisons
+    ├── counterfactuals/            # Counterfactual images & difference maps
+    └── comparisons/                # Side-by-side comparison panels & grids
 ```
 
 ### Dataset
