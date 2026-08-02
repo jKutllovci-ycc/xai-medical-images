@@ -13,8 +13,12 @@ What it does:
 """
 
 import json
+import os
 from multiprocessing import freeze_support
 from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(".matplotlib-cache").resolve()))
+os.environ.setdefault("XDG_CACHE_HOME", str(Path(".cache").resolve()))
 
 import matplotlib
 
@@ -87,10 +91,11 @@ def main():
 
     device = get_device()
     eval_transform = build_eval_transform()
+    num_workers = NUM_WORKERS if device.type == "cuda" else 0
 
     test_dataset = ChestXRayDataset(DATA_DIR, "test", eval_transform)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE,
-                             shuffle=False, num_workers=NUM_WORKERS)
+                             shuffle=False, num_workers=num_workers)
     print(f"Test set: {len(test_dataset)} images")
 
     if len(test_dataset) == 0:
