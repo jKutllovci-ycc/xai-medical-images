@@ -244,11 +244,20 @@ def make_lung_field_mask(rgb):
 
 
 def compute_gradcam_mask(model, input_tensor, target_idx, device, cam_threshold=0.3):
-    cam = GradCAMPlusPlus(model=model, target_layers=[model.layer4[-1]])
-    grayscale_cam = cam(
-        input_tensor=input_tensor,
-        targets=[ClassifierOutputTarget(target_idx)],
-    )[0]
+    previous_grad_state = [p.requires_grad for p in model.parameters()]
+    try:
+        for p in model.parameters():
+            p.requires_grad_(True)
+
+        cam_input = input_tensor.detach().clone().requires_grad_(True)
+        cam = GradCAMPlusPlus(model=model, target_layers=[model.layer4[-1]])
+        grayscale_cam = cam(
+            input_tensor=cam_input,
+            targets=[ClassifierOutputTarget(target_idx)],
+        )[0]
+    finally:
+        for p, requires_grad in zip(model.parameters(), previous_grad_state):
+            p.requires_grad_(requires_grad)
 
     gradcam_mask = np.where(grayscale_cam >= cam_threshold, 1.0, 0.0).astype(np.float32)
     gradcam_mask = cv2.dilate(gradcam_mask, np.ones((7, 7), np.uint8), iterations=1)
