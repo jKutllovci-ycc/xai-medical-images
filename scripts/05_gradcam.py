@@ -46,8 +46,11 @@ DROPOUT = 0.3
 NUM_CLASSES = 2
 
 DATA_DIR = Path("data/raw/chest_xray")
+SPLIT_CSV = Path("data/processed/splits/stratified_split.csv")
 CHECKPOINT_PATH = Path("experiments/checkpoints/best_classifier.pt")
 OUTPUT_DIR = Path("outputs/gradcam")
+SELECTED_CSV = Path("outputs/selected_examples.csv")
+DECISION_THRESHOLD_PATH = Path("experiments/results/decision_threshold.json")
 CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 METHODS = {
     "gradcam": GradCAM,
@@ -57,17 +60,59 @@ METHODS = {
 }
 
 
+def apply_image_preprocessing(image, mode="baseline"):
+    image = image.convert("RGB")
+    if mode == "baseline":
+        return image
+    gray = np.asarray(image.convert("L"))
+    if mode == "clahe_denoise":
+        gray = cv2.fastNlMeansDenoising(gray, None, h=5, templateWindowSize=7, searchWindowSize=21)
+    elif mode != "clahe":
+        raise ValueError(f"Unknown preprocessing mode: {mode}")
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return Image.fromarray(clahe.apply(gray)).convert("RGB")
+
+
+def load_preprocess_mode_from_checkpoint(checkpoint_path, fallback="baseline"):
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except Exception:
+        return fallback
+    return checkpoint.get("config", {}).get("preprocess_mode", fallback)
+
+
+def load_decision_threshold(fallback=0.5):
+    if not DECISION_THRESHOLD_PATH.exists():
+        return fallback
+    try:
+        with open(DECISION_THRESHOLD_PATH) as f:
+            return float(json.load(f).get("decision_threshold", fallback))
+    except Exception:
+        return fallback
+
+
+def predict_label_from_probs(prob, threshold):
+    return int(float(prob[1]) >= threshold)
+
+
 class ChestXRayDataset(Dataset):
-    def __init__(self, root_dir, split, transform):
-        self.root_dir = Path(root_dir) / split
+    def __init__(self, root_dir, split, transform, split_csv=None):
+        self.root_dir = Path(root_dir)
         self.transform = transform
         self.samples, self.labels = [], []
-        for label_idx, class_name in enumerate(CLASS_NAMES):
-            class_dir = self.root_dir / class_name
-            if class_dir.exists():
-                for img_path in sorted(class_dir.glob("*.jpeg")):
-                    self.samples.append(img_path)
-                    self.labels.append(label_idx)
+        if split_csv and Path(split_csv).exists():
+            with open(split_csv, newline="") as f:
+                for row in csv.DictReader(f):
+                    if row["split"] == split:
+                        self.samples.append(Path(row["path"]))
+                        self.labels.append(CLASS_NAMES.index(row["class"]))
+        else:
+            for label_idx, class_name in enumerate(CLASS_NAMES):
+                class_dir = self.root_dir / split / class_name
+                if class_dir.exists():
+                    for img_path in sorted(class_dir.glob("*.jpeg")):
+                        self.samples.append(img_path)
+                        self.labels.append(label_idx)
 
     def __len__(self):
         return len(self.samples)
@@ -87,11 +132,15 @@ def get_device():
 
 def build_eval_transform():
     return transforms.Compose([
+        transforms.Lambda(lambda img: apply_image_preprocessing(img, CURRENT_PREPROCESS_MODE)),
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
     ])
+
+
+CURRENT_PREPROCESS_MODE = "baseline"
 
 
 def build_model(device):
@@ -117,7 +166,7 @@ def build_model(device):
     return model
 
 
-def score_test_set(model, dataset, device):
+def score_test_set(model, dataset, device, decision_threshold):
     num_workers = NUM_WORKERS if device.type == "cuda" else 0
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False,
                         num_workers=num_workers)
@@ -127,7 +176,7 @@ def score_test_set(model, dataset, device):
             images = images.to(device)
             logits = model(images)
             probs = torch.softmax(logits, dim=1).cpu().numpy()
-            preds = probs.argmax(axis=1)
+            preds = np.array([predict_label_from_probs(prob, decision_threshold) for prob in probs])
             for path, true_idx, pred_idx, prob in zip(paths, labels.numpy(), preds, probs):
                 confidence = float(prob[pred_idx])
                 true_prob = float(prob[true_idx])
@@ -142,6 +191,7 @@ def score_test_set(model, dataset, device):
                     "normal_prob": float(prob[0]),
                     "pneumonia_prob": float(prob[1]),
                     "true_class_prob": true_prob,
+                    "decision_threshold": float(decision_threshold),
                     "correct": bool(pred_idx == true_idx),
                 })
     return rows
@@ -179,8 +229,46 @@ def select_examples(rows, max_per_class):
 
 
 def load_display_image(path):
-    img = Image.open(path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
+    img = apply_image_preprocessing(Image.open(path).convert("RGB"), CURRENT_PREPROCESS_MODE)
+    img = img.resize((IMG_SIZE, IMG_SIZE))
     return np.asarray(img).astype(np.float32) / 255.0
+
+
+def write_selected_examples(rows, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def load_selected_examples(path):
+    path = Path(path)
+    if not path.exists():
+        return None
+    rows = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            row["true_idx"] = int(row["true_idx"])
+            row["pred_idx"] = int(row["pred_idx"])
+            for key in ["confidence", "normal_prob", "pneumonia_prob", "true_class_prob"]:
+                row[key] = float(row[key])
+            row["correct"] = str(row["correct"]).lower() == "true"
+            rows.append(row)
+    return rows
+
+
+def resolve_selected_examples(all_rows, selected_csv, max_per_class, force_reselect=False):
+    if not force_reselect:
+        selected = load_selected_examples(selected_csv)
+        if selected:
+            available = {r["path"] for r in all_rows}
+            if all(r["path"] in available for r in selected):
+                return selected
+    selected = select_examples(all_rows, max_per_class)
+    write_selected_examples(selected, selected_csv)
+    return selected
 
 
 def make_lung_field_mask(rgb):
@@ -288,22 +376,49 @@ def save_single_result(row, rgb, cam, mask, overlay, output_dir, idx):
     plt.imsave(output_dir / f"{stem}_mask.png", mask, cmap="gray", vmin=0, vmax=1)
     Image.fromarray(overlay).save(output_dir / f"{stem}_overlay.png")
 
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4.5))
+    fig, axes = plt.subplots(1, 4, figsize=(19, 5.8))
     axes[0].imshow(rgb)
-    axes[0].set_title(f"Original\nTrue: {row['true_label']}", fontsize=10)
+    axes[0].set_title(
+        "1. Original X-ray\n"
+        f"True label: {row['true_label']}",
+        fontsize=10,
+    )
     axes[1].imshow(mask, cmap="gray", vmin=0, vmax=1)
-    axes[1].set_title("Lung-field Mask", fontsize=10)
+    axes[1].set_title(
+        "2. Estimated lung area\n"
+        "White = lung/chest area\nBlack = ignored background",
+        fontsize=10,
+    )
     axes[2].imshow(cam, cmap="turbo", vmin=0, vmax=1)
-    axes[2].set_title("Sharpened CAM", fontsize=10)
+    axes[2].set_title(
+        "3. Model focus map\n"
+        "Bright colors = stronger focus\nDark = little focus",
+        fontsize=10,
+    )
     axes[3].imshow(overlay)
     axes[3].set_title(
-        f"Pred: {row['pred_label']}\nconf={row['confidence']:.3f}",
+        "4. Focus drawn on X-ray\n"
+        f"Model predicted: {row['pred_label']} ({row['confidence']:.3f})",
         fontsize=10,
     )
     for ax in axes:
         ax.axis("off")
-    fig.suptitle(Path(row["path"]).name, fontsize=11)
-    plt.tight_layout()
+    fig.suptitle(
+        f"Where the model looked for {Path(row['path']).name}",
+        fontsize=12,
+        y=0.98,
+    )
+    fig.text(
+        0.5,
+        0.035,
+        "How to read this: this image does not change the X-ray. It only shows which parts of the chest image "
+        "the trained model used most when deciding NORMAL or PNEUMONIA.",
+        ha="center",
+        va="bottom",
+        fontsize=10,
+        wrap=True,
+    )
+    plt.tight_layout(rect=[0, 0.09, 1, 0.90])
     panel_path = output_dir / f"{stem}_panel.png"
     plt.savefig(panel_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -324,14 +439,20 @@ def save_comparison_result(row, rgb, legacy_overlay, improved_overlay, mask,
     )
     axes[1].imshow(legacy_overlay)
     axes[1].set_title(
-        "Before\nVanilla Grad-CAM\npredicted class, no mask",
+        "Older focus map\n"
+        "Can highlight messy/background areas",
         fontsize=10,
     )
     axes[2].imshow(mask, cmap="gray", vmin=0, vmax=1)
-    axes[2].set_title("Added\nlung-field mask", fontsize=10)
+    axes[2].set_title(
+        "Chest area guide\n"
+        "White = keep, black = ignore",
+        fontsize=10,
+    )
     axes[3].imshow(improved_overlay)
     axes[3].set_title(
-        "Now\nGrad-CAM++\npneumonia target + sharpened mask",
+        "Improved focus map\n"
+        "Cleaner highlight inside chest area",
         fontsize=10,
     )
 
@@ -400,14 +521,14 @@ def save_comparison_grid(results, output_dir):
         status = "OK" if result["correct"] else "MISS"
         axes[row_idx, 0].imshow(result["legacy_overlay"])
         axes[row_idx, 0].set_title(
-            f"Before: vanilla Grad-CAM\n{status} {result['true_label']} -> "
+            f"Older focus map\n{status} {result['true_label']} -> "
             f"{result['pred_label']} ({result['confidence']:.2f})",
             fontsize=8,
         )
         axes[row_idx, 1].imshow(result["overlay"])
         axes[row_idx, 1].set_title(
-            f"Now: {result['target_label']}-targeted Grad-CAM++\n"
-            "lung mask + percentile sharpening",
+            f"Improved focus map for {result['target_label']}\n"
+            "Cleaner highlight inside chest area",
             fontsize=8,
         )
         for ax in axes[row_idx]:
@@ -426,6 +547,8 @@ def write_metadata(results, all_rows, output_dir, args):
         "aug_smooth": args.aug_smooth,
         "eigen_smooth": args.eigen_smooth,
         "max_per_class": args.max_per_class,
+        "preprocess_mode": results[0].get("preprocess_mode", "") if results else "",
+        "selected_examples_csv": str(SELECTED_CSV),
         "selected_count": len(results),
         "all_test_count": len(all_rows),
         "selected": [
@@ -474,6 +597,8 @@ def parse_args():
                         help="Keep old Grad-CAM files in the output directory.")
     parser.add_argument("--no-comparison", action="store_true",
                         help="Skip before/after panels comparing legacy and improved Grad-CAM.")
+    parser.add_argument("--reselect", action="store_true",
+                        help="Force a new shared selected_examples.csv for all XAI steps.")
     return parser.parse_args()
 
 
@@ -487,17 +612,26 @@ def main():
 
     device = get_device()
     print(f"Using device: {device}")
+    global CURRENT_PREPROCESS_MODE
+    preprocess_mode = load_preprocess_mode_from_checkpoint(CHECKPOINT_PATH, fallback="baseline")
+    CURRENT_PREPROCESS_MODE = preprocess_mode
     transform = build_eval_transform()
-    dataset = ChestXRayDataset(DATA_DIR, "test", transform)
+    split_csv = SPLIT_CSV if SPLIT_CSV.exists() else None
+    dataset = ChestXRayDataset(DATA_DIR, "test", transform, split_csv=split_csv)
     if len(dataset) == 0:
         raise SystemExit(
             f"No test images found under {DATA_DIR}. Run scripts/01_download_data.py first."
         )
 
     model = build_model(device)
-    all_rows = score_test_set(model, dataset, device)
-    selected_rows = select_examples(all_rows, args.max_per_class)
+    decision_threshold = load_decision_threshold()
+    all_rows = score_test_set(model, dataset, device, decision_threshold)
+    selected_rows = resolve_selected_examples(
+        all_rows, SELECTED_CSV, args.max_per_class, force_reselect=args.reselect
+    )
     print(f"Selected {len(selected_rows)} informative examples from {len(all_rows)} test images")
+    print(f"Preprocessing: {preprocess_mode}")
+    print(f"Decision threshold: {decision_threshold:.3f}")
 
     if args.target_layer == "layer3":
         target_layers = [model.layer3[-1]]
@@ -557,6 +691,7 @@ def main():
             **quality,
             "target_idx": int(target_idx),
             "target_label": CLASS_NAMES[int(target_idx)],
+            "preprocess_mode": preprocess_mode,
             "panel_path": str(panel_path),
             "comparison_path": str(comparison_path),
             "overlay": overlay,
