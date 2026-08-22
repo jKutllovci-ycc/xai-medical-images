@@ -572,12 +572,18 @@ def main():
     low_focus = [r for r in results if r["cam_in_mask_fraction"] < 0.75]
     misses = [r for r in results if not r["correct"]]
 
-    print(f"\nSaved Grad-CAM outputs to {OUTPUT_DIR}/")
-    print(f"  Summary grid: {OUTPUT_DIR / 'gradcam_summary_grid.png'}")
+    print("\nStep 5 outputs")
+    print(f"  Output directory:     {OUTPUT_DIR}")
+    print(f"  Summary grid:         {OUTPUT_DIR / 'gradcam_summary_grid.png'}")
     if not args.no_comparison:
-        print(f"  Before/after: {OUTPUT_DIR / 'gradcam_before_after_grid.png'}")
-    print(f"  Metadata:     {OUTPUT_DIR / 'gradcam_metadata.json'}")
-    print(f"  Predictions:  {OUTPUT_DIR / 'test_predictions.csv'}")
+        print(f"  Before/after grid:    {OUTPUT_DIR / 'gradcam_before_after_grid.png'}")
+    print(f"  Metadata JSON:        {OUTPUT_DIR / 'gradcam_metadata.json'}")
+    print(f"  Metadata CSV:         {OUTPUT_DIR / 'gradcam_metadata.csv'}")
+    print(f"  Test predictions CSV: {OUTPUT_DIR / 'test_predictions.csv'}")
+    print(f"  Per-image panels:     {OUTPUT_DIR / '*_panel.png'}")
+    print(f"  Per-image overlays:   {OUTPUT_DIR / '*_overlay.png'}")
+    print(f"  Per-image heatmaps:   {OUTPUT_DIR / '*_heatmap.png'}")
+    print(f"  Per-image masks:      {OUTPUT_DIR / '*_mask.png'}")
     print(f"  Selected misses: {len(misses)}")
     print(f"  Low in-mask focus (<0.75): {len(low_focus)}")
     if low_focus:
