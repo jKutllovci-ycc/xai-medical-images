@@ -365,6 +365,13 @@ def main():
     plt.tight_layout()
     plt.savefig(RESULTS_DIR / "training_curves.png", dpi=150, bbox_inches="tight")
     print(f"Saved: {RESULTS_DIR / 'training_curves.png'}")
+
+    print("\nStep 3 outputs")
+    print(f"  Checkpoint directory: {CHECKPOINT_DIR}")
+    print(f"  Best checkpoint:      {CHECKPOINT_DIR / 'best_classifier.pt'}")
+    print(f"  Results directory:    {RESULTS_DIR}")
+    print(f"  Training history:     {RESULTS_DIR / 'training_history.json'}")
+    print(f"  Training curves:      {RESULTS_DIR / 'training_curves.png'}")
     print("\nDone! Run 04_evaluate.py next.")
 
 
