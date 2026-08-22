@@ -48,12 +48,16 @@ DROPOUT = 0.3
 NUM_CLASSES = 2
 
 DATA_DIR = Path("data/raw/chest_xray")
+SPLIT_CSV = Path("data/processed/splits/stratified_split.csv")
 CHECKPOINT_PATH = Path("experiments/checkpoints/best_classifier.pt")
 OUTPUT_DIR = Path("outputs/guided_counterfactuals")
+SELECTED_CSV = Path("outputs/selected_examples.csv")
+DECISION_THRESHOLD_PATH = Path("experiments/results/decision_threshold.json")
 CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+CURRENT_PREPROCESS_MODE = "baseline"
 
 
 def confidence_band(confidence):
@@ -64,17 +68,67 @@ def confidence_band(confidence):
     return "borderline"
 
 
+def apply_image_preprocessing(image, mode="baseline"):
+    image = image.convert("RGB")
+    if mode == "baseline":
+        return image
+    gray = np.asarray(image.convert("L"))
+    if mode == "clahe_denoise":
+        gray = cv2.fastNlMeansDenoising(gray, None, h=5, templateWindowSize=7, searchWindowSize=21)
+    elif mode != "clahe":
+        raise ValueError(f"Unknown preprocessing mode: {mode}")
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return Image.fromarray(clahe.apply(gray)).convert("RGB")
+
+
+def load_preprocess_mode_from_checkpoint(checkpoint_path, fallback="baseline"):
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except Exception:
+        return fallback
+    return checkpoint.get("config", {}).get("preprocess_mode", fallback)
+
+
+def load_decision_threshold(fallback=0.5):
+    if not DECISION_THRESHOLD_PATH.exists():
+        return fallback
+    try:
+        with open(DECISION_THRESHOLD_PATH) as f:
+            return float(json.load(f).get("decision_threshold", fallback))
+    except Exception:
+        return fallback
+
+
+def predict_label_from_probs(prob, threshold):
+    return int(float(prob[1]) >= threshold)
+
+
+def clamp_normalized(tensor):
+    mean = IMAGENET_MEAN.to(tensor.device).view(1, 3, 1, 1)
+    std = IMAGENET_STD.to(tensor.device).view(1, 3, 1, 1)
+    lower = (torch.zeros_like(mean) - mean) / std
+    upper = (torch.ones_like(mean) - mean) / std
+    return torch.max(torch.min(tensor, upper), lower)
+
+
 class ChestXRayDataset(Dataset):
-    def __init__(self, root_dir, split, transform):
-        self.root_dir = Path(root_dir) / split
+    def __init__(self, root_dir, split, transform, split_csv=None):
+        self.root_dir = Path(root_dir)
         self.transform = transform
         self.samples, self.labels = [], []
-        for label_idx, class_name in enumerate(CLASS_NAMES):
-            class_dir = self.root_dir / class_name
-            if class_dir.exists():
-                for img_path in sorted(class_dir.glob("*.jpeg")):
-                    self.samples.append(img_path)
-                    self.labels.append(label_idx)
+        if split_csv and Path(split_csv).exists():
+            with open(split_csv, newline="") as f:
+                for row in csv.DictReader(f):
+                    if row["split"] == split:
+                        self.samples.append(Path(row["path"]))
+                        self.labels.append(CLASS_NAMES.index(row["class"]))
+        else:
+            for label_idx, class_name in enumerate(CLASS_NAMES):
+                class_dir = self.root_dir / split / class_name
+                if class_dir.exists():
+                    for img_path in sorted(class_dir.glob("*.jpeg")):
+                        self.samples.append(img_path)
+                        self.labels.append(label_idx)
 
     def __len__(self):
         return len(self.samples)
@@ -94,6 +148,7 @@ def get_device():
 
 def build_eval_transform():
     return transforms.Compose([
+        transforms.Lambda(lambda img: apply_image_preprocessing(img, CURRENT_PREPROCESS_MODE)),
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -123,7 +178,7 @@ def build_model(device):
     return model
 
 
-def score_test_set(model, dataset, device):
+def score_test_set(model, dataset, device, decision_threshold):
     num_workers = NUM_WORKERS if device.type == "cuda" else 0
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False,
                         num_workers=num_workers)
@@ -133,7 +188,7 @@ def score_test_set(model, dataset, device):
             images = images.to(device)
             logits = model(images)
             probs = torch.softmax(logits, dim=1).cpu().numpy()
-            preds = probs.argmax(axis=1)
+            preds = np.array([predict_label_from_probs(prob, decision_threshold) for prob in probs])
             for path, true_idx, pred_idx, prob in zip(
                 paths, labels.numpy(), preds, probs
             ):
@@ -148,6 +203,7 @@ def score_test_set(model, dataset, device):
                     "confidence_band": confidence_band(float(prob[pred_idx])),
                     "normal_prob": float(prob[0]),
                     "pneumonia_prob": float(prob[1]),
+                    "decision_threshold": float(decision_threshold),
                     "correct": bool(pred_idx == true_idx),
                 })
     return rows
@@ -181,8 +237,48 @@ def select_examples(rows, max_per_class):
 
 
 def load_display_image(path):
-    img = Image.open(path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
+    img = apply_image_preprocessing(Image.open(path).convert("RGB"), CURRENT_PREPROCESS_MODE)
+    img = img.resize((IMG_SIZE, IMG_SIZE))
     return np.asarray(img).astype(np.float32) / 255.0
+
+
+def write_selected_examples(rows, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def load_selected_examples(path):
+    path = Path(path)
+    if not path.exists():
+        return None
+    rows = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            row["true_idx"] = int(row["true_idx"])
+            row["pred_idx"] = int(row["pred_idx"])
+            for key in ["confidence", "normal_prob", "pneumonia_prob"]:
+                row[key] = float(row[key])
+            if "true_class_prob" in row:
+                row["true_class_prob"] = float(row["true_class_prob"])
+            row["correct"] = str(row["correct"]).lower() == "true"
+            rows.append(row)
+    return rows
+
+
+def resolve_selected_examples(all_rows, selected_csv, max_per_class, force_reselect=False):
+    if not force_reselect:
+        selected = load_selected_examples(selected_csv)
+        if selected:
+            available = {r["path"] for r in all_rows}
+            if all(r["path"] in available for r in selected):
+                return selected
+    selected = select_examples(all_rows, max_per_class)
+    write_selected_examples(selected, selected_csv)
+    return selected
 
 
 def make_lung_field_mask(rgb):
@@ -306,7 +402,7 @@ def generate_counterfactual(
 
     for step in range(steps):
         optimizer.zero_grad()
-        cf_input = input_tensor + delta * mask_tensor
+        cf_input = clamp_normalized(input_tensor + delta * mask_tensor)
         logits = model(cf_input)
         probs = F.softmax(logits, dim=1)
 
@@ -390,51 +486,87 @@ def save_guided_panel(
     true_label = row["true_label"].lower()
     stem = f"{idx:02d}_{true_label}_{Path(row['path']).stem}"
 
-    fig, axes = plt.subplots(2, 4, figsize=(22, 10))
+    fig, axes = plt.subplots(2, 4, figsize=(24, 11.5))
 
     axes[0, 0].imshow(original_rgb)
     axes[0, 0].set_title(
-        f"Original\nTrue: {row['true_label']} | Pred: {row['pred_label']} ({row['confidence']:.3f})",
-        fontsize=9,
+        "1. Original X-ray\n"
+        f"True: {row['true_label']}\n"
+        f"Model predicted: {row['pred_label']} ({row['confidence']:.3f})",
+        fontsize=10,
     )
 
     axes[0, 1].imshow(gradcam_heatmap, cmap="turbo", vmin=0, vmax=1)
-    axes[0, 1].set_title("Grad-CAM++ Heatmap\n(where model looks)", fontsize=9)
+    axes[0, 1].set_title(
+        "2. Model focus map\n"
+        "Bright colors = where the model looked",
+        fontsize=10,
+    )
 
     axes[0, 2].imshow(lung_mask, cmap="gray", vmin=0, vmax=1)
-    axes[0, 2].set_title("Lung-field Mask\n(anatomy constraint)", fontsize=9)
+    axes[0, 2].set_title(
+        "3. Chest area guide\n"
+        "White = allowed lung/chest region\nBlack = protected area",
+        fontsize=10,
+    )
 
     axes[0, 3].imshow(guided_mask, cmap="hot", vmin=0, vmax=1)
-    axes[0, 3].set_title("Guided Mask\n(Grad-CAM + lung field)", fontsize=9)
+    axes[0, 3].set_title(
+        "4. Focused edit area\n"
+        "Only edit where chest area and model focus meet",
+        fontsize=10,
+    )
 
     axes[1, 0].imshow(cf_rgb_standard)
     axes[1, 0].set_title(
-        f"Standard CF\n-> {cf_label_std} ({cf_conf_std:.3f})",
-        fontsize=9,
+        "5. Changed X-ray\n"
+        "Synthetic image after edits anywhere in lung area\n"
+        f"New prediction: {cf_label_std} ({cf_conf_std:.3f})",
+        fontsize=10,
     )
 
     axes[1, 1].imshow(diff_standard)
-    axes[1, 1].set_title("Standard Diff\n(changes spread widely)", fontsize=9)
+    axes[1, 1].set_title(
+        "6. Changes used to flip answer\n"
+        "Colors show which pixels changed",
+        fontsize=10,
+    )
 
     axes[1, 2].imshow(cf_rgb_guided)
     axes[1, 2].set_title(
-        f"Guided CF\n-> {cf_label_guided} ({cf_conf_guided:.3f})",
-        fontsize=9,
+        "7. Focused changed X-ray\n"
+        "Synthetic image after focused edits\n"
+        f"New prediction: {cf_label_guided} ({cf_conf_guided:.3f})",
+        fontsize=10,
     )
 
     axes[1, 3].imshow(diff_guided)
-    axes[1, 3].set_title("Guided Diff\n(changes focused on model attention)", fontsize=9)
+    axes[1, 3].set_title(
+        "8. Focused changes\n"
+        "Edits pushed toward model focus areas",
+        fontsize=10,
+    )
 
     for ax in axes.reshape(-1):
         ax.axis("off")
 
     status = "correct" if row["correct"] else "misclassified"
     fig.suptitle(
-        f"{Path(row['path']).name}  |  {status}  |  "
-        f"Standard vs Grad-CAM-Guided Counterfactual",
+        f"Normal changed image vs focused changed image for {Path(row['path']).name}  |  {status}",
         fontsize=12, y=0.98,
     )
-    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.text(
+        0.5,
+        0.035,
+        "How to read this: both rows ask what small changes would make the model switch its answer. "
+        "The normal version may change any allowed chest area. The focused version tries to change only the "
+        "areas the model was already looking at, so the explanation should be easier to understand.",
+        ha="center",
+        va="bottom",
+        fontsize=10,
+        wrap=True,
+    )
+    plt.tight_layout(rect=[0, 0.08, 1, 0.93])
     panel_path = output_dir / f"{stem}_guided_panel.png"
     plt.savefig(panel_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -469,22 +601,28 @@ def save_summary_grid(results, output_dir):
         )
 
         axes[i, 1].imshow(r["gradcam_heatmap"], cmap="turbo", vmin=0, vmax=1)
-        axes[i, 1].set_title("Grad-CAM attention", fontsize=8)
+        axes[i, 1].set_title(
+            "Model focus map\nBright = looked here more",
+            fontsize=8,
+        )
 
         axes[i, 2].imshow(r["guided_cf_rgb"])
         axes[i, 2].set_title(
-            f"Guided CF: {r['guided_cf_pred_label']} ({r['guided_cf_confidence']:.2f})",
+            f"Focused changed image:\n{r['guided_cf_pred_label']} ({r['guided_cf_confidence']:.2f})",
             fontsize=8,
         )
 
         axes[i, 3].imshow(r["guided_diff_overlay"])
-        axes[i, 3].set_title("Focused changes", fontsize=8)
+        axes[i, 3].set_title(
+            "Colored areas = focused changes\nthat flipped the answer",
+            fontsize=8,
+        )
 
         for ax in axes[i]:
             ax.axis("off")
 
     plt.suptitle(
-        "Grad-CAM-Guided Counterfactuals: Precise, Focused Changes",
+        "Focused Explanations: Where the Model Looked and What Had to Change",
         fontsize=13,
     )
     plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -512,14 +650,16 @@ def save_comparison_grid(results, output_dir):
         axes[i, 1].imshow(r["standard_diff_overlay"])
         std_status = "flipped" if r["standard_cf_success"] else "partial"
         axes[i, 1].set_title(
-            f"Standard CF diff [{std_status}]\nL1={r['standard_l1']:.4f}",
+            f"Normal changes [{std_status}]\n"
+            f"Change size={r['standard_l1']:.4f}",
             fontsize=8,
         )
 
         axes[i, 2].imshow(r["guided_diff_overlay"])
         g_status = "flipped" if r["guided_cf_success"] else "partial"
         axes[i, 2].set_title(
-            f"Guided CF diff [{g_status}]\nL1={r['guided_l1']:.4f} "
+            f"Focused changes [{g_status}]\n"
+            f"Change size={r['guided_l1']:.4f} "
             f"({r['l1_reduction_pct']:.0f}% smaller)",
             fontsize=8,
         )
@@ -528,7 +668,7 @@ def save_comparison_grid(results, output_dir):
             ax.axis("off")
 
     plt.suptitle(
-        "Standard vs Guided Counterfactuals: More Precise with Less Change",
+        "Normal Changes vs Focused Changes: Smaller Usually Means Easier to Explain",
         fontsize=13,
     )
     plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -556,6 +696,8 @@ def write_metadata(results, all_rows, output_dir, args):
         "tv_weight": args.tv_weight,
         "confidence_threshold": args.confidence_threshold,
         "max_per_class": args.max_per_class,
+        "preprocess_mode": results[0].get("preprocess_mode", "") if results else "",
+        "selected_examples_csv": str(SELECTED_CSV),
         "selected_count": len(results),
         "guided_success_count": sum(1 for r in results if r["guided_cf_success"]),
         "standard_success_count": sum(1 for r in results if r["standard_cf_success"]),
@@ -602,6 +744,8 @@ def parse_args():
     parser.add_argument("--blend-weight", type=float, default=0.7,
                         help="How strongly Grad-CAM focuses the mask (0=lung only, 1=CAM only).")
     parser.add_argument("--no-clean", action="store_true")
+    parser.add_argument("--reselect", action="store_true",
+                        help="Force a new shared selected_examples.csv for all XAI steps.")
     return parser.parse_args()
 
 
@@ -616,8 +760,12 @@ def main():
     device = get_device()
     print(f"Using device: {device}")
 
+    global CURRENT_PREPROCESS_MODE
+    preprocess_mode = load_preprocess_mode_from_checkpoint(CHECKPOINT_PATH, fallback="baseline")
+    CURRENT_PREPROCESS_MODE = preprocess_mode
     transform = build_eval_transform()
-    dataset = ChestXRayDataset(DATA_DIR, "test", transform)
+    split_csv = SPLIT_CSV if SPLIT_CSV.exists() else None
+    dataset = ChestXRayDataset(DATA_DIR, "test", transform, split_csv=split_csv)
     if len(dataset) == 0:
         raise SystemExit(
             f"No test images found under {DATA_DIR}. "
@@ -625,10 +773,15 @@ def main():
         )
 
     model = build_model(device)
-    all_rows = score_test_set(model, dataset, device)
-    selected = select_examples(all_rows, args.max_per_class)
+    decision_threshold = load_decision_threshold()
+    all_rows = score_test_set(model, dataset, device, decision_threshold)
+    selected = resolve_selected_examples(
+        all_rows, SELECTED_CSV, args.max_per_class, force_reselect=args.reselect
+    )
     print(f"Selected {len(selected)} examples from {len(all_rows)} test images")
     print(f"CAM threshold: {args.cam_threshold}, blend weight: {args.blend_weight}")
+    print(f"Preprocessing: {preprocess_mode}")
+    print(f"Decision threshold: {decision_threshold:.3f}")
 
     results = []
     for idx, row in enumerate(tqdm(selected, desc="Generating guided counterfactuals")):
@@ -671,17 +824,17 @@ def main():
         )
 
         with torch.no_grad():
-            std_cf_tensor = input_tensor + std_delta * lung_mask_tensor
+            std_cf_tensor = clamp_normalized(input_tensor + std_delta * lung_mask_tensor)
             std_logits = model(std_cf_tensor)
             std_probs = F.softmax(std_logits, dim=1).cpu().numpy()[0]
-            std_pred_idx = int(std_probs.argmax())
+            std_pred_idx = predict_label_from_probs(std_probs, decision_threshold)
             std_confidence = float(std_probs[std_pred_idx])
             std_pred_label = CLASS_NAMES[std_pred_idx]
 
-            guided_cf_tensor = input_tensor + guided_delta * guided_mask_tensor
+            guided_cf_tensor = clamp_normalized(input_tensor + guided_delta * guided_mask_tensor)
             guided_logits = model(guided_cf_tensor)
             guided_probs = F.softmax(guided_logits, dim=1).cpu().numpy()[0]
-            guided_pred_idx = int(guided_probs.argmax())
+            guided_pred_idx = predict_label_from_probs(guided_probs, decision_threshold)
             guided_confidence = float(guided_probs[guided_pred_idx])
             guided_pred_label = CLASS_NAMES[guided_pred_idx]
 
@@ -725,6 +878,7 @@ def main():
             "guided_active_change_outside_lung_fraction": guided_localisation["active_change_outside_lung_fraction"],
             "l1_reduction_pct": round(l1_reduction, 1),
             "guided_mask_coverage": round(guided_mask_coverage, 4),
+            "preprocess_mode": preprocess_mode,
             "panel_path": str(panel_path),
             "original_rgb": original_rgb,
             "gradcam_heatmap": gradcam_heatmap,
