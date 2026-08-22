@@ -136,16 +136,28 @@ def save_detailed_panel(
     ) if has_guided else None
 
     n_cols = 7 if has_guided else 5
-    fig, axes = plt.subplots(1, n_cols, figsize=(n_cols * 3.5, 4.5))
+    fig, axes = plt.subplots(1, n_cols, figsize=(n_cols * 3.8, 5.8))
 
     axes[0].imshow(original)
-    axes[0].set_title(f"Original\nTrue: {true_label}", fontsize=9)
+    axes[0].set_title(
+        "1. Original X-ray\n"
+        f"True label: {true_label}",
+        fontsize=10,
+    )
 
     axes[1].imshow(gc_overlay)
-    axes[1].set_title("Grad-CAM\n(where model looks)", fontsize=9)
+    axes[1].set_title(
+        "2. Model focus on X-ray\n"
+        "Bright colors = looked here more",
+        fontsize=10,
+    )
 
     axes[2].imshow(gc_heatmap)
-    axes[2].set_title("Grad-CAM Heatmap\n(activation intensity)", fontsize=9)
+    axes[2].set_title(
+        "3. Focus map alone\n"
+        "Bright = stronger model focus",
+        fontsize=10,
+    )
 
     cf_label = cf_entry.get("cf_pred_label", "?")
     cf_conf = cf_entry.get("cf_confidence", 0)
@@ -153,11 +165,18 @@ def save_detailed_panel(
     cf_status = "flipped" if cf_success else "partial"
     axes[3].imshow(cf_image)
     axes[3].set_title(
-        f"Standard CF [{cf_status}]\n-> {cf_label} ({cf_conf:.3f})", fontsize=9,
+        "4. Changed X-ray\n"
+        "Synthetic edited image\n"
+        f"New prediction: {cf_label} ({cf_conf:.3f})",
+        fontsize=10,
     )
 
     axes[4].imshow(cf_diff)
-    axes[4].set_title(f"CF Difference\n(what changed)", fontsize=9)
+    axes[4].set_title(
+        "5. Needed changes\n"
+        "Colors show what had to change",
+        fontsize=10,
+    )
 
     if has_guided and guided_cf is not None:
         g_label = guided_entry.get("guided_cf_pred_label", "?")
@@ -168,12 +187,17 @@ def save_detailed_panel(
 
         axes[5].imshow(guided_cf)
         axes[5].set_title(
-            f"Guided CF [{g_status}]\n-> {g_label} ({g_conf:.3f})", fontsize=9,
+            "6. Focused changed X-ray\n"
+            "Focused synthetic edit\n"
+            f"New prediction: {g_label} ({g_conf:.3f})",
+            fontsize=10,
         )
 
         axes[6].imshow(guided_diff)
         axes[6].set_title(
-            f"Guided Diff\n({l1_red:.0f}% less change)", fontsize=9,
+            "7. Focused needed changes\n"
+            f"Usually smaller edits\nChange reduction: {l1_red:.0f}%",
+            fontsize=10,
         )
 
     for ax in axes:
@@ -181,11 +205,21 @@ def save_detailed_panel(
 
     status = "correct" if correct else "MISCLASSIFIED"
     fig.suptitle(
-        f"{filename}  |  {status}  |  Pred: {pred_label} ({confidence:.3f})  |  "
-        f"Grad-CAM/CF overlap: {overlap_score:.2f}",
-        fontsize=11, y=0.99,
+        f"Explanation comparison for {filename}  |  original prediction: {pred_label} ({confidence:.3f})  |  "
+        f"focus/change agreement: {overlap_score:.2f}",
+        fontsize=12, y=0.99,
     )
-    plt.tight_layout(rect=[0, 0, 1, 0.90])
+    fig.text(
+        0.5,
+        0.035,
+        "How to read this: the focus map shows where the model looked. The changed images show what pixels had "
+        "to change to flip the model answer. If the colored regions match, the explanation is more consistent.",
+        ha="center",
+        va="bottom",
+        fontsize=10,
+        wrap=True,
+    )
+    plt.tight_layout(rect=[0, 0.10, 1, 0.90])
     panel_path = output_dir / f"{idx:02d}_{file_stem}_comparison.png"
     plt.savefig(panel_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -202,9 +236,9 @@ def save_master_grid(results, output_dir):
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.5, n_rows * 3.2))
     axes = np.atleast_2d(axes)
 
-    headers = ["Original", "Grad-CAM", "Standard CF Diff", "Guided CF Diff", "Overlap"]
+    headers = ["Original", "Model Focus", "Normal Changes", "Focused Changes", "Agreement"]
     if not has_guided:
-        headers = ["Original", "Grad-CAM", "CF Image", "CF Diff"]
+        headers = ["Original", "Model Focus", "Changed X-ray", "Needed Changes"]
 
     for col, header in enumerate(headers[:n_cols]):
         axes[0, col].set_title(header, fontsize=10, fontweight="bold")
@@ -248,9 +282,9 @@ def save_master_grid(results, output_dir):
         for ax in axes[row_idx]:
             ax.axis("off")
 
-    title = "Grad-CAM vs Counterfactual: Where the Model Looks vs What Would Change"
+    title = "Where the Model Looked vs What Had to Change"
     if has_guided:
-        title = "Grad-CAM vs Standard CF vs Guided CF"
+        title = "Model Focus vs Normal Changes vs Focused Changes"
     plt.suptitle(title, fontsize=13, y=0.99)
     plt.tight_layout(rect=[0.06, 0, 1, 0.97])
     plt.savefig(output_dir / "master_comparison_grid.png", dpi=150, bbox_inches="tight")
@@ -270,11 +304,11 @@ def save_overlap_chart(results, output_dir):
     bars = ax.bar(range(len(files)), overlaps, color=colors)
     ax.set_xticks(range(len(files)))
     ax.set_xticklabels(files, rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("IoU Overlap")
+    ax.set_ylabel("Agreement score")
     ax.set_title(
-        "Grad-CAM / Counterfactual Region Overlap (IoU)\n"
-        "High overlap = model changes what it attends to. "
-        "Low = CF changes different regions than Grad-CAM highlights.",
+        "Do the focus colors and change colors appear in the same places?\n"
+        "High = model focus and needed changes agree. "
+        "Low = the model looked somewhere different from the pixels that changed.",
     )
     ax.axhline(y=0.3, color="gray", linestyle="--", linewidth=0.8)
     ax.set_ylim(0, max(max(overlaps) + 0.1, 0.5))
