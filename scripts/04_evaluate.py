@@ -186,6 +186,12 @@ def main():
         json.dump(metrics, f, indent=2)
     print(f"Saved: {RESULTS_DIR / 'test_metrics.json'}")
 
+    print("\nStep 4 outputs")
+    print(f"  Output directory: {RESULTS_DIR}")
+    print(f"  Test metrics:     {RESULTS_DIR / 'test_metrics.json'}")
+    print(f"  Confusion matrix: {RESULTS_DIR / 'confusion_matrix.png'}")
+    print(f"  ROC curve:        {RESULTS_DIR / 'roc_curve.png'}")
+
     print("\nDone! Run 05_gradcam.py next.")
 
 
