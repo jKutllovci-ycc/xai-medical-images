@@ -66,6 +66,109 @@ def trapezoid_auc(values):
     return np.trapz(values)
 
 
+def confidence_band(confidence):
+    if confidence >= 0.90:
+        return "high"
+    if confidence >= 0.70:
+        return "moderate"
+    return "borderline"
+
+
+def make_lung_field_mask(rgb):
+    gray = (rgb.mean(axis=2) * 255).astype(np.uint8)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, body = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    body = cv2.morphologyEx(body, cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8))
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(body, 8)
+    if num_labels > 1:
+        largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        body = np.where(labels == largest, 255, 0).astype(np.uint8)
+
+    margin = int(IMG_SIZE * 0.04)
+    body[:, :margin] = 0
+    body[:, -margin:] = 0
+    body[:margin, :] = 0
+    body[-margin:, :] = 0
+
+    body_pixels = gray[body > 0]
+    if body_pixels.size < 10:
+        return body.astype(np.float32) / 255.0
+
+    dark_cutoff = np.percentile(body_pixels, 58)
+    very_dark = np.percentile(body_pixels, 3)
+    candidate = (
+        (gray <= dark_cutoff) & (gray >= very_dark) & (body > 0)
+    ).astype(np.uint8) * 255
+
+    roi = np.zeros_like(candidate)
+    roi[int(IMG_SIZE * 0.12):int(IMG_SIZE * 0.88),
+        int(IMG_SIZE * 0.08):int(IMG_SIZE * 0.92)] = 255
+    candidate = cv2.bitwise_and(candidate, roi)
+
+    center_band = np.zeros_like(candidate)
+    center_band[:, int(IMG_SIZE * 0.42):int(IMG_SIZE * 0.58)] = 255
+    candidate = cv2.bitwise_and(candidate, cv2.bitwise_not(center_band))
+    candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+
+    contours, _ = cv2.findContours(candidate, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    kept = np.zeros_like(candidate)
+    min_area = int(0.012 * IMG_SIZE * IMG_SIZE)
+    max_area = int(0.35 * IMG_SIZE * IMG_SIZE)
+    plausible = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if not (min_area <= area <= max_area):
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        if h < IMG_SIZE * 0.18 or w < IMG_SIZE * 0.08:
+            continue
+        cx = x + w / 2
+        if IMG_SIZE * 0.12 <= cx <= IMG_SIZE * 0.88:
+            plausible.append((area, contour))
+
+    for _, contour in sorted(plausible, key=lambda item: item[0], reverse=True)[:4]:
+        hull = cv2.convexHull(contour)
+        cv2.drawContours(kept, [hull], -1, 255, thickness=-1)
+
+    if not kept.any():
+        kept = candidate
+    kept = cv2.dilate(kept, np.ones((19, 19), np.uint8), iterations=1)
+    kept = cv2.morphologyEx(kept, cv2.MORPH_CLOSE, np.ones((17, 17), np.uint8))
+    kept = cv2.bitwise_and(kept, body)
+    return kept.astype(np.float32) / 255.0
+
+
+def anatomical_localisation_metrics(signal, lung_mask, threshold=0.3):
+    signal = np.asarray(signal, dtype=np.float32)
+    lung_mask = (np.asarray(lung_mask) > 0.5).astype(np.float32)
+    total_signal = float(signal.sum())
+    if total_signal <= 1e-8:
+        signal_inside_lung = 0.0
+        signal_outside_lung = 0.0
+    else:
+        signal_inside_lung = float((signal * lung_mask).sum() / total_signal)
+        signal_outside_lung = 1.0 - signal_inside_lung
+
+    active = signal >= threshold
+    active_count = int(active.sum())
+    if active_count == 0:
+        active_inside_lung = 0.0
+        active_outside_lung = 0.0
+    else:
+        active_inside_lung = float(lung_mask[active].mean())
+        active_outside_lung = 1.0 - active_inside_lung
+
+    return {
+        "signal_inside_lung_fraction": round(signal_inside_lung, 4),
+        "signal_outside_lung_fraction": round(signal_outside_lung, 4),
+        "active_inside_lung_fraction": round(active_inside_lung, 4),
+        "active_outside_lung_fraction": round(active_outside_lung, 4),
+    }
+
+
 class ChestXRayDataset(Dataset):
     def __init__(self, root_dir, split, transform):
         self.root_dir = Path(root_dir) / split
@@ -143,6 +246,7 @@ def score_test_set(model, dataset, device):
                     "pred_idx": int(pred_idx),
                     "pred_label": CLASS_NAMES[int(pred_idx)],
                     "confidence": float(prob[pred_idx]),
+                    "confidence_band": confidence_band(float(prob[pred_idx])),
                     "correct": bool(pred_idx == true_idx),
                 })
     return rows
@@ -228,7 +332,7 @@ def insertion_deletion_test(model, input_tensor, cam, target_class, device, step
     }
 
 
-def compute_counterfactual_metrics(original_rgb, cf_rgb):
+def compute_counterfactual_metrics(original_rgb, cf_rgb, lung_mask=None):
     ssim_val = ssim(
         original_rgb, cf_rgb,
         channel_axis=2,
@@ -240,13 +344,16 @@ def compute_counterfactual_metrics(original_rgb, cf_rgb):
     diff = np.abs(original_rgb - cf_rgb).mean(axis=2)
     changed_pixels = float((diff > 0.02).mean())
 
-    return {
+    metrics = {
         "ssim": round(float(ssim_val), 4),
         "l1_distance": round(l1_dist, 6),
         "l2_distance": round(l2_dist, 6),
         "changed_pixel_fraction": round(changed_pixels, 4),
         "sparsity": round(1.0 - changed_pixels, 4),
     }
+    if lung_mask is not None:
+        metrics.update(anatomical_localisation_metrics(diff, lung_mask, threshold=0.02))
+    return metrics
 
 
 def evaluate_gradcam(model, selected, transform, device):
@@ -255,6 +362,10 @@ def evaluate_gradcam(model, selected, transform, device):
     results = []
 
     for row in tqdm(selected, desc="Grad-CAM fidelity"):
+        original_rgb = np.asarray(
+            Image.open(row["path"]).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
+        ).astype(np.float32) / 255.0
+        lung_mask = make_lung_field_mask(original_rgb)
         input_tensor = transform(
             Image.open(row["path"]).convert("RGB")
         ).unsqueeze(0).to(device)
@@ -272,6 +383,9 @@ def evaluate_gradcam(model, selected, transform, device):
         cam_sparsity = float((grayscale_cam < 0.1).mean())
         cam_peak = float(grayscale_cam.max())
         cam_coverage = float((grayscale_cam >= 0.3).mean())
+        anatomy = anatomical_localisation_metrics(
+            grayscale_cam, lung_mask, threshold=0.3,
+        )
 
         results.append({
             "file": row["file"],
@@ -279,10 +393,15 @@ def evaluate_gradcam(model, selected, transform, device):
             "pred_label": row["pred_label"],
             "correct": row["correct"],
             "confidence": row["confidence"],
+            "confidence_band": row["confidence_band"],
             **fidelity,
             "cam_sparsity": round(cam_sparsity, 4),
             "cam_peak": round(cam_peak, 4),
             "cam_coverage_30pct": round(cam_coverage, 4),
+            "cam_signal_inside_lung_fraction": anatomy["signal_inside_lung_fraction"],
+            "cam_signal_outside_lung_fraction": anatomy["signal_outside_lung_fraction"],
+            "cam_active_inside_lung_fraction": anatomy["active_inside_lung_fraction"],
+            "cam_active_outside_lung_fraction": anatomy["active_outside_lung_fraction"],
         })
 
     return results
@@ -311,12 +430,15 @@ def evaluate_counterfactuals(cf_dir, label):
         cf_img = np.asarray(
             Image.open(cf_candidates[0]).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
         ).astype(np.float32) / 255.0
+        lung_mask = make_lung_field_mask(original)
 
-        metrics = compute_counterfactual_metrics(original, cf_img)
+        metrics = compute_counterfactual_metrics(original, cf_img, lung_mask)
         results.append({
             "file": entry.get("file", ""),
             "true_label": entry.get("true_label", ""),
             "pred_label": entry.get("pred_label", ""),
+            "confidence": entry.get("confidence", 0),
+            "confidence_band": confidence_band(entry.get("confidence", 0)),
             "cf_pred_label": entry.get("cf_pred_label", ""),
             "cf_success": entry.get("cf_success", False),
             "cf_confidence": entry.get("cf_confidence", 0),
@@ -349,12 +471,15 @@ def evaluate_guided_counterfactuals(guided_dir):
         cf_img = np.asarray(
             Image.open(cf_candidates[0]).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
         ).astype(np.float32) / 255.0
+        lung_mask = make_lung_field_mask(original)
 
-        metrics = compute_counterfactual_metrics(original, cf_img)
+        metrics = compute_counterfactual_metrics(original, cf_img, lung_mask)
         results.append({
             "file": entry.get("file", ""),
             "true_label": entry.get("true_label", ""),
             "pred_label": entry.get("pred_label", ""),
+            "confidence": entry.get("confidence", 0),
+            "confidence_band": confidence_band(entry.get("confidence", 0)),
             "guided_cf_pred_label": entry.get("guided_cf_pred_label", ""),
             "guided_cf_success": entry.get("guided_cf_success", False),
             "guided_cf_confidence": entry.get("guided_cf_confidence", 0),
@@ -451,6 +576,67 @@ def save_counterfactual_quality_chart(cf_results, guided_results, output_dir):
     plt.close(fig)
 
 
+def save_anatomical_plausibility_chart(gradcam_results, cf_results, guided_results, output_dir):
+    labels = []
+    inside_signal = []
+    outside_active = []
+
+    if gradcam_results:
+        labels.append("Grad-CAM++")
+        inside_signal.append(np.mean([
+            r["cam_signal_inside_lung_fraction"] for r in gradcam_results
+        ]))
+        outside_active.append(np.mean([
+            r["cam_active_outside_lung_fraction"] for r in gradcam_results
+        ]))
+
+    if cf_results:
+        labels.append("Standard CF")
+        inside_signal.append(np.mean([
+            r["signal_inside_lung_fraction"] for r in cf_results
+        ]))
+        outside_active.append(np.mean([
+            r["active_outside_lung_fraction"] for r in cf_results
+        ]))
+
+    if guided_results:
+        labels.append("Guided CF")
+        inside_signal.append(np.mean([
+            r["signal_inside_lung_fraction"] for r in guided_results
+        ]))
+        outside_active.append(np.mean([
+            r["active_outside_lung_fraction"] for r in guided_results
+        ]))
+
+    if not labels:
+        return
+
+    x = np.arange(len(labels))
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5.5))
+    axes[0].bar(x, inside_signal, color="#2563eb")
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(labels)
+    axes[0].set_ylim(0, 1)
+    axes[0].set_ylabel("Fraction")
+    axes[0].set_title("Signal inside estimated lung field\n(higher = more anatomically plausible)")
+    for i, v in enumerate(inside_signal):
+        axes[0].text(i, min(v + 0.03, 0.98), f"{v:.2f}", ha="center")
+
+    axes[1].bar(x, outside_active, color="#dc2626")
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(labels)
+    axes[1].set_ylim(0, 1)
+    axes[1].set_ylabel("Fraction")
+    axes[1].set_title("Active explanation outside estimated lung field\n(lower = better)")
+    for i, v in enumerate(outside_active):
+        axes[1].text(i, min(v + 0.03, 0.98), f"{v:.2f}", ha="center")
+
+    plt.tight_layout()
+    plt.savefig(output_dir / "anatomical_plausibility_chart.png", dpi=150,
+                bbox_inches="tight")
+    plt.close(fig)
+
+
 def save_insertion_deletion_curves(gradcam_results, output_dir):
     if not gradcam_results:
         return
@@ -519,6 +705,9 @@ def main():
     save_fidelity_chart(gradcam_results, OUTPUT_DIR)
     save_insertion_deletion_curves(gradcam_results, OUTPUT_DIR)
     save_counterfactual_quality_chart(cf_results, guided_results, OUTPUT_DIR)
+    save_anatomical_plausibility_chart(
+        gradcam_results, cf_results, guided_results, OUTPUT_DIR,
+    )
 
     summary = {
         "gradcam": {
@@ -532,6 +721,12 @@ def main():
             "mean_faithfulness": round(float(np.mean(
                 [r["faithfulness"] for r in gradcam_results]
             )), 4) if gradcam_results else 0,
+            "mean_cam_signal_inside_lung_fraction": round(float(np.mean(
+                [r["cam_signal_inside_lung_fraction"] for r in gradcam_results]
+            )), 4) if gradcam_results else 0,
+            "mean_cam_active_outside_lung_fraction": round(float(np.mean(
+                [r["cam_active_outside_lung_fraction"] for r in gradcam_results]
+            )), 4) if gradcam_results else 0,
             "per_image": gradcam_results,
         },
         "standard_counterfactual": {
@@ -544,6 +739,12 @@ def main():
             )), 6) if cf_results else 0,
             "mean_sparsity": round(float(np.mean(
                 [r["sparsity"] for r in cf_results]
+            )), 4) if cf_results else 0,
+            "mean_change_inside_lung_fraction": round(float(np.mean(
+                [r["signal_inside_lung_fraction"] for r in cf_results]
+            )), 4) if cf_results else 0,
+            "mean_active_change_outside_lung_fraction": round(float(np.mean(
+                [r["active_outside_lung_fraction"] for r in cf_results]
             )), 4) if cf_results else 0,
             "success_rate": round(
                 sum(1 for r in cf_results if r["cf_success"]) / max(len(cf_results), 1), 4
@@ -561,6 +762,12 @@ def main():
             "mean_sparsity": round(float(np.mean(
                 [r["sparsity"] for r in guided_results]
             )), 4) if guided_results else 0,
+            "mean_change_inside_lung_fraction": round(float(np.mean(
+                [r["signal_inside_lung_fraction"] for r in guided_results]
+            )), 4) if guided_results else 0,
+            "mean_active_change_outside_lung_fraction": round(float(np.mean(
+                [r["active_outside_lung_fraction"] for r in guided_results]
+            )), 4) if guided_results else 0,
             "success_rate": round(
                 sum(1 for r in guided_results if r.get("guided_cf_success", False)) /
                 max(len(guided_results), 1), 4
@@ -574,13 +781,25 @@ def main():
 
     print(f"\nExplanation quality evaluation complete.")
     print(f"  Grad-CAM faithfulness: {summary['gradcam']['mean_faithfulness']:.4f}")
+    print("  Grad-CAM signal inside lung: "
+          f"{summary['gradcam']['mean_cam_signal_inside_lung_fraction']:.4f}")
     if cf_results:
         print(f"  Standard CF SSIM: {summary['standard_counterfactual']['mean_ssim']:.4f}, "
-              f"sparsity: {summary['standard_counterfactual']['mean_sparsity']:.4f}")
+              f"sparsity: {summary['standard_counterfactual']['mean_sparsity']:.4f}, "
+              "change inside lung: "
+              f"{summary['standard_counterfactual']['mean_change_inside_lung_fraction']:.4f}")
     if guided_results:
         print(f"  Guided CF SSIM: {summary['guided_counterfactual']['mean_ssim']:.4f}, "
-              f"sparsity: {summary['guided_counterfactual']['mean_sparsity']:.4f}")
-    print(f"  Outputs: {OUTPUT_DIR}/")
+              f"sparsity: {summary['guided_counterfactual']['mean_sparsity']:.4f}, "
+              "change inside lung: "
+              f"{summary['guided_counterfactual']['mean_change_inside_lung_fraction']:.4f}")
+    print("\nStep 8 outputs")
+    print(f"  Output directory:              {OUTPUT_DIR}")
+    print(f"  Quality metrics JSON:          {OUTPUT_DIR / 'explanation_quality.json'}")
+    print(f"  Grad-CAM fidelity chart:       {OUTPUT_DIR / 'gradcam_fidelity_chart.png'}")
+    print(f"  Insertion/deletion curves:     {OUTPUT_DIR / 'insertion_deletion_curves.png'}")
+    print(f"  Counterfactual quality chart:  {OUTPUT_DIR / 'counterfactual_quality_chart.png'}")
+    print(f"  Anatomical plausibility chart: {OUTPUT_DIR / 'anatomical_plausibility_chart.png'}")
     print(f"\nDone! Run 09_compare_gradcam_counterfactual.py next.")
 
 
