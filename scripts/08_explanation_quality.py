@@ -48,16 +48,20 @@ DROPOUT = 0.3
 NUM_CLASSES = 2
 
 DATA_DIR = Path("data/raw/chest_xray")
+SPLIT_CSV = Path("data/processed/splits/stratified_split.csv")
 CHECKPOINT_PATH = Path("experiments/checkpoints/best_classifier.pt")
 RESULTS_DIR = Path("experiments/results")
 GRADCAM_DIR = Path("outputs/gradcam")
 CF_DIR = Path("outputs/counterfactuals")
 GUIDED_CF_DIR = Path("outputs/guided_counterfactuals")
 OUTPUT_DIR = Path("outputs/explanation_quality")
+SELECTED_CSV = Path("outputs/selected_examples.csv")
+DECISION_THRESHOLD_PATH = RESULTS_DIR / "decision_threshold.json"
 CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+CURRENT_PREPROCESS_MODE = "baseline"
 
 
 def trapezoid_auc(values):
@@ -72,6 +76,47 @@ def confidence_band(confidence):
     if confidence >= 0.70:
         return "moderate"
     return "borderline"
+
+
+def apply_image_preprocessing(image, mode="baseline"):
+    image = image.convert("RGB")
+    if mode == "baseline":
+        return image
+    gray = np.asarray(image.convert("L"))
+    if mode == "clahe_denoise":
+        gray = cv2.fastNlMeansDenoising(gray, None, h=5, templateWindowSize=7, searchWindowSize=21)
+    elif mode != "clahe":
+        raise ValueError(f"Unknown preprocessing mode: {mode}")
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return Image.fromarray(clahe.apply(gray)).convert("RGB")
+
+
+def load_preprocess_mode_from_checkpoint(checkpoint_path, fallback="baseline"):
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except Exception:
+        return fallback
+    return checkpoint.get("config", {}).get("preprocess_mode", fallback)
+
+
+def load_decision_threshold(fallback=0.5):
+    if not DECISION_THRESHOLD_PATH.exists():
+        return fallback
+    try:
+        with open(DECISION_THRESHOLD_PATH) as f:
+            return float(json.load(f).get("decision_threshold", fallback))
+    except Exception:
+        return fallback
+
+
+def predict_label_from_probs(prob, threshold):
+    return int(float(prob[1]) >= threshold)
+
+
+def load_display_image(path):
+    img = apply_image_preprocessing(Image.open(path).convert("RGB"), CURRENT_PREPROCESS_MODE)
+    img = img.resize((IMG_SIZE, IMG_SIZE))
+    return np.asarray(img).astype(np.float32) / 255.0
 
 
 def make_lung_field_mask(rgb):
@@ -169,17 +214,46 @@ def anatomical_localisation_metrics(signal, lung_mask, threshold=0.3):
     }
 
 
+def percentile_normalize(cam, mask, low=55, high=99.3):
+    masked_values = cam[mask > 0.1]
+    if masked_values.size < 10:
+        masked_values = cam.reshape(-1)
+
+    lo = np.percentile(masked_values, low)
+    hi = np.percentile(masked_values, high)
+    if hi <= lo:
+        hi = float(masked_values.max())
+        lo = float(masked_values.min())
+    if hi <= lo:
+        return np.zeros_like(cam, dtype=np.float32)
+
+    cam = np.clip((cam - lo) / (hi - lo), 0, 1)
+    cam = cam * mask
+    cam = cv2.GaussianBlur(cam, (0, 0), sigmaX=1.0)
+    if cam.max() > 0:
+        cam = cam / cam.max()
+    return cam.astype(np.float32)
+
+
 class ChestXRayDataset(Dataset):
-    def __init__(self, root_dir, split, transform):
-        self.root_dir = Path(root_dir) / split
+    def __init__(self, root_dir, split, transform, split_csv=None):
+        self.root_dir = Path(root_dir)
         self.transform = transform
         self.samples, self.labels = [], []
-        for label_idx, class_name in enumerate(CLASS_NAMES):
-            class_dir = self.root_dir / class_name
-            if class_dir.exists():
-                for img_path in sorted(class_dir.glob("*.jpeg")):
-                    self.samples.append(img_path)
-                    self.labels.append(label_idx)
+        if split_csv and Path(split_csv).exists():
+            import csv
+            with open(split_csv, newline="") as f:
+                for row in csv.DictReader(f):
+                    if row["split"] == split:
+                        self.samples.append(Path(row["path"]))
+                        self.labels.append(CLASS_NAMES.index(row["class"]))
+        else:
+            for label_idx, class_name in enumerate(CLASS_NAMES):
+                class_dir = self.root_dir / split / class_name
+                if class_dir.exists():
+                    for img_path in sorted(class_dir.glob("*.jpeg")):
+                        self.samples.append(img_path)
+                        self.labels.append(label_idx)
 
     def __len__(self):
         return len(self.samples)
@@ -199,11 +273,53 @@ def get_device():
 
 def build_eval_transform():
     return transforms.Compose([
+        transforms.Lambda(lambda img: apply_image_preprocessing(img, CURRENT_PREPROCESS_MODE)),
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
     ])
+
+
+def write_selected_examples(rows, path):
+    import csv
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def load_selected_examples(path):
+    import csv
+    path = Path(path)
+    if not path.exists():
+        return None
+    rows = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            row["true_idx"] = int(row["true_idx"])
+            row["pred_idx"] = int(row["pred_idx"])
+            for key in ["confidence"]:
+                row[key] = float(row[key])
+            if "true_class_prob" in row:
+                row["true_class_prob"] = float(row["true_class_prob"])
+            row["correct"] = str(row["correct"]).lower() == "true"
+            rows.append(row)
+    return rows
+
+
+def resolve_selected_examples(all_rows, selected_csv, max_per_class, force_reselect=False):
+    if not force_reselect:
+        selected = load_selected_examples(selected_csv)
+        if selected:
+            available = {r["path"] for r in all_rows}
+            if all(r["path"] in available for r in selected):
+                return selected
+    selected = select_examples(all_rows, max_per_class)
+    write_selected_examples(selected, selected_csv)
+    return selected
 
 
 def build_model(device):
@@ -224,7 +340,7 @@ def build_model(device):
     return model
 
 
-def score_test_set(model, dataset, device):
+def score_test_set(model, dataset, device, decision_threshold):
     num_workers = NUM_WORKERS if device.type == "cuda" else 0
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False,
                         num_workers=num_workers)
@@ -234,7 +350,7 @@ def score_test_set(model, dataset, device):
             images = images.to(device)
             logits = model(images)
             probs = torch.softmax(logits, dim=1).cpu().numpy()
-            preds = probs.argmax(axis=1)
+            preds = np.array([predict_label_from_probs(prob, decision_threshold) for prob in probs])
             for path, true_idx, pred_idx, prob in zip(
                 paths, labels.numpy(), preds, probs
             ):
@@ -247,6 +363,7 @@ def score_test_set(model, dataset, device):
                     "pred_label": CLASS_NAMES[int(pred_idx)],
                     "confidence": float(prob[pred_idx]),
                     "confidence_band": confidence_band(float(prob[pred_idx])),
+                    "decision_threshold": float(decision_threshold),
                     "correct": bool(pred_idx == true_idx),
                 })
     return rows
@@ -362,9 +479,7 @@ def evaluate_gradcam(model, selected, transform, device):
     results = []
 
     for row in tqdm(selected, desc="Grad-CAM fidelity"):
-        original_rgb = np.asarray(
-            Image.open(row["path"]).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
-        ).astype(np.float32) / 255.0
+        original_rgb = load_display_image(row["path"])
         lung_mask = make_lung_field_mask(original_rgb)
         input_tensor = transform(
             Image.open(row["path"]).convert("RGB")
@@ -375,6 +490,7 @@ def evaluate_gradcam(model, selected, transform, device):
             input_tensor=input_tensor,
             targets=[ClassifierOutputTarget(target_idx)],
         )[0]
+        grayscale_cam = percentile_normalize(grayscale_cam, lung_mask)
 
         fidelity = insertion_deletion_test(
             model, input_tensor, grayscale_cam, target_idx, device,
@@ -393,7 +509,7 @@ def evaluate_gradcam(model, selected, transform, device):
             "pred_label": row["pred_label"],
             "correct": row["correct"],
             "confidence": row["confidence"],
-            "confidence_band": row["confidence_band"],
+            "confidence_band": row.get("confidence_band", confidence_band(row["confidence"])),
             **fidelity,
             "cam_sparsity": round(cam_sparsity, 4),
             "cam_peak": round(cam_peak, 4),
@@ -424,9 +540,7 @@ def evaluate_counterfactuals(cf_dir, label):
         if not cf_candidates or not Path(path).exists():
             continue
 
-        original = np.asarray(
-            Image.open(path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
-        ).astype(np.float32) / 255.0
+        original = load_display_image(path)
         cf_img = np.asarray(
             Image.open(cf_candidates[0]).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
         ).astype(np.float32) / 255.0
@@ -465,9 +579,7 @@ def evaluate_guided_counterfactuals(guided_dir):
         if not cf_candidates or not Path(path).exists():
             continue
 
-        original = np.asarray(
-            Image.open(path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
-        ).astype(np.float32) / 255.0
+        original = load_display_image(path)
         cf_img = np.asarray(
             Image.open(cf_candidates[0]).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
         ).astype(np.float32) / 255.0
@@ -505,12 +617,15 @@ def save_fidelity_chart(gradcam_results, output_dir):
 
     x = np.arange(len(files))
     w = 0.35
-    axes[0].bar(x - w / 2, ins_aucs, w, label="Insertion AUC", color="#22c55e")
-    axes[0].bar(x + w / 2, del_aucs, w, label="Deletion AUC", color="#ef4444")
+    axes[0].bar(x - w / 2, ins_aucs, w, label="Reveal important pixels", color="#22c55e")
+    axes[0].bar(x + w / 2, del_aucs, w, label="Remove important pixels", color="#ef4444")
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(files, rotation=45, ha="right", fontsize=7)
-    axes[0].set_ylabel("AUC")
-    axes[0].set_title("Grad-CAM Insertion vs Deletion AUC\n(higher insertion + lower deletion = more faithful)")
+    axes[0].set_ylabel("Area under curve")
+    axes[0].set_title(
+        "Does the focus map point to useful pixels?\n"
+        "Good = prediction rises when focus pixels are revealed and drops when removed"
+    )
     axes[0].legend()
 
     colors = ["#22c55e" if f > 0.3 else "#f59e0b" if f > 0.1 else "#ef4444"
@@ -518,8 +633,11 @@ def save_fidelity_chart(gradcam_results, output_dir):
     axes[1].bar(x, faithfulness, color=colors)
     axes[1].set_xticks(x)
     axes[1].set_xticklabels(files, rotation=45, ha="right", fontsize=7)
-    axes[1].set_ylabel("Faithfulness (Ins - Del)")
-    axes[1].set_title("Grad-CAM Faithfulness Score\n(green=good, red=poor)")
+    axes[1].set_ylabel("Usefulness score")
+    axes[1].set_title(
+        "Overall focus-map usefulness\n"
+        "Green = stronger evidence, red = weak or unreliable"
+    )
     axes[1].axhline(y=0.3, color="gray", linestyle="--", linewidth=0.8)
 
     plt.tight_layout()
@@ -537,7 +655,7 @@ def save_counterfactual_quality_chart(cf_results, guided_results, output_dir):
     cf_sparsity = [r["sparsity"] for r in cf_results]
     cf_l1 = [r["l1_distance"] for r in cf_results]
 
-    labels = ["Standard CF"]
+    labels = ["Normal changed image"]
     ssim_means = [np.mean(cf_ssim)]
     sparsity_means = [np.mean(cf_sparsity)]
     l1_means = [np.mean(cf_l1)]
@@ -546,7 +664,7 @@ def save_counterfactual_quality_chart(cf_results, guided_results, output_dir):
         g_ssim = [r["ssim"] for r in guided_results]
         g_sparsity = [r["sparsity"] for r in guided_results]
         g_l1 = [r["l1_distance"] for r in guided_results]
-        labels.append("Guided CF")
+        labels.append("Focused changed image")
         ssim_means.append(np.mean(g_ssim))
         sparsity_means.append(np.mean(g_sparsity))
         l1_means.append(np.mean(g_l1))
@@ -554,19 +672,28 @@ def save_counterfactual_quality_chart(cf_results, guided_results, output_dir):
     colors = ["#3b82f6", "#22c55e"][:len(labels)]
 
     axes[0].bar(labels, ssim_means, color=colors)
-    axes[0].set_title("SSIM (higher = more similar to original)\nCloser to 1.0 = more realistic")
+    axes[0].set_title(
+        "Similarity to original X-ray\n"
+        "Higher = changed image still looks close to the original"
+    )
     axes[0].set_ylim(0, 1)
     for i, v in enumerate(ssim_means):
         axes[0].text(i, v + 0.02, f"{v:.3f}", ha="center", fontsize=11)
 
     axes[1].bar(labels, sparsity_means, color=colors)
-    axes[1].set_title("Sparsity (higher = fewer pixels changed)\nMore sparse = more focused explanation")
+    axes[1].set_title(
+        "How many pixels stayed unchanged\n"
+        "Higher = fewer pixels changed, easier to explain"
+    )
     axes[1].set_ylim(0, 1)
     for i, v in enumerate(sparsity_means):
         axes[1].text(i, v + 0.02, f"{v:.3f}", ha="center", fontsize=11)
 
     axes[2].bar(labels, l1_means, color=colors)
-    axes[2].set_title("L1 Distance (lower = smaller perturbation)\nSmaller = more minimal change")
+    axes[2].set_title(
+        "Total change size\n"
+        "Lower = smaller synthetic edit was enough to flip the model"
+    )
     for i, v in enumerate(l1_means):
         axes[2].text(i, v + 0.001, f"{v:.4f}", ha="center", fontsize=11)
 
@@ -582,7 +709,7 @@ def save_anatomical_plausibility_chart(gradcam_results, cf_results, guided_resul
     outside_active = []
 
     if gradcam_results:
-        labels.append("Grad-CAM++")
+        labels.append("Model focus map")
         inside_signal.append(np.mean([
             r["cam_signal_inside_lung_fraction"] for r in gradcam_results
         ]))
@@ -591,7 +718,7 @@ def save_anatomical_plausibility_chart(gradcam_results, cf_results, guided_resul
         ]))
 
     if cf_results:
-        labels.append("Standard CF")
+        labels.append("Normal changed image")
         inside_signal.append(np.mean([
             r["signal_inside_lung_fraction"] for r in cf_results
         ]))
@@ -600,7 +727,7 @@ def save_anatomical_plausibility_chart(gradcam_results, cf_results, guided_resul
         ]))
 
     if guided_results:
-        labels.append("Guided CF")
+        labels.append("Focused changed image")
         inside_signal.append(np.mean([
             r["signal_inside_lung_fraction"] for r in guided_results
         ]))
@@ -617,8 +744,11 @@ def save_anatomical_plausibility_chart(gradcam_results, cf_results, guided_resul
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(labels)
     axes[0].set_ylim(0, 1)
-    axes[0].set_ylabel("Fraction")
-    axes[0].set_title("Signal inside estimated lung field\n(higher = more anatomically plausible)")
+    axes[0].set_ylabel("Fraction of explanation")
+    axes[0].set_title(
+        "How much explanation stays inside the chest/lung area?\n"
+        "Higher is better because pneumonia evidence should be in the chest"
+    )
     for i, v in enumerate(inside_signal):
         axes[0].text(i, min(v + 0.03, 0.98), f"{v:.2f}", ha="center")
 
@@ -626,8 +756,11 @@ def save_anatomical_plausibility_chart(gradcam_results, cf_results, guided_resul
     axes[1].set_xticks(x)
     axes[1].set_xticklabels(labels)
     axes[1].set_ylim(0, 1)
-    axes[1].set_ylabel("Fraction")
-    axes[1].set_title("Active explanation outside estimated lung field\n(lower = better)")
+    axes[1].set_ylabel("Fraction of explanation")
+    axes[1].set_title(
+        "How much explanation leaks outside the chest/lung area?\n"
+        "Lower is better because outside regions are less medically useful"
+    )
     for i, v in enumerate(outside_active):
         axes[1].text(i, min(v + 0.03, 0.98), f"{v:.2f}", ha="center")
 
@@ -652,22 +785,22 @@ def save_insertion_deletion_curves(gradcam_results, output_dir):
 
         r = gradcam_results[i]
         steps_x = np.linspace(0, 1, len(r["insertion_curve"]))
-        axes[i].plot(steps_x, r["insertion_curve"], "g-", linewidth=2, label="Insertion")
-        axes[i].plot(steps_x, r["deletion_curve"], "r-", linewidth=2, label="Deletion")
+        axes[i].plot(steps_x, r["insertion_curve"], "g-", linewidth=2, label="Reveal focus pixels")
+        axes[i].plot(steps_x, r["deletion_curve"], "r-", linewidth=2, label="Remove focus pixels")
         axes[i].fill_between(steps_x, r["insertion_curve"], r["deletion_curve"],
                              alpha=0.15, color="blue")
-        axes[i].set_xlabel("Fraction of pixels revealed/removed")
-        axes[i].set_ylabel("Target class probability")
+        axes[i].set_xlabel("Amount of focus area tested")
+        axes[i].set_ylabel("Model confidence")
         status = "OK" if r["correct"] else "MISS"
         axes[i].set_title(
-            f"{status} {r['file'][:25]}\nFaith={r['faithfulness']:.3f}",
+            f"{status} {r['file'][:25]}\nUsefulness={r['faithfulness']:.3f}",
             fontsize=9,
         )
         axes[i].legend(fontsize=8)
         axes[i].set_ylim(-0.05, 1.05)
 
     plt.suptitle(
-        "Insertion/Deletion Curves — Does Grad-CAM highlight what the model actually uses?",
+        "Focus-map test: does removing highlighted areas reduce model confidence?",
         fontsize=13,
     )
     plt.tight_layout(rect=[0, 0, 1, 0.95])
@@ -682,8 +815,12 @@ def main():
     device = get_device()
     print(f"Using device: {device}")
 
+    global CURRENT_PREPROCESS_MODE
+    preprocess_mode = load_preprocess_mode_from_checkpoint(CHECKPOINT_PATH, fallback="baseline")
+    CURRENT_PREPROCESS_MODE = preprocess_mode
     transform = build_eval_transform()
-    dataset = ChestXRayDataset(DATA_DIR, "test", transform)
+    split_csv = SPLIT_CSV if SPLIT_CSV.exists() else None
+    dataset = ChestXRayDataset(DATA_DIR, "test", transform, split_csv=split_csv)
     if len(dataset) == 0:
         raise SystemExit(
             f"No test images found under {DATA_DIR}. "
@@ -691,8 +828,13 @@ def main():
         )
 
     model = build_model(device)
-    all_rows = score_test_set(model, dataset, device)
-    selected = select_examples(all_rows, max_per_class=6)
+    decision_threshold = load_decision_threshold()
+    all_rows = score_test_set(model, dataset, device, decision_threshold)
+    selected = resolve_selected_examples(
+        all_rows, SELECTED_CSV, max_per_class=6, force_reselect=False
+    )
+    print(f"Preprocessing: {preprocess_mode}")
+    print(f"Decision threshold: {decision_threshold:.3f}")
 
     gradcam_results = evaluate_gradcam(model, selected, transform, device)
 
