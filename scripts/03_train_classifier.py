@@ -13,6 +13,8 @@ What it does:
     - Saves training curves plot to experiments/results/training_curves.png
 """
 
+import argparse
+import csv
 import json
 import os
 import time
@@ -27,6 +29,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import cv2
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -52,27 +55,45 @@ LABEL_SMOOTHING = 0.05
 SEED = 42
 
 DATA_DIR = Path("data/raw/chest_xray")
+SPLIT_CSV = Path("data/processed/splits/stratified_split.csv")
 CHECKPOINT_DIR = Path("experiments/checkpoints")
 RESULTS_DIR = Path("experiments/results")
+CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 
 
-# --- Dataset ---
+def apply_image_preprocessing(image, mode="baseline"):
+    image = image.convert("RGB")
+    if mode == "baseline":
+        return image
+    gray = np.asarray(image.convert("L"))
+    if mode == "clahe_denoise":
+        gray = cv2.fastNlMeansDenoising(gray, None, h=5, templateWindowSize=7, searchWindowSize=21)
+    elif mode != "clahe":
+        raise ValueError(f"Unknown preprocessing mode: {mode}")
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return Image.fromarray(clahe.apply(gray)).convert("RGB")
+
+
 class ChestXRayDataset(Dataset):
-    CLASSES = ["NORMAL", "PNEUMONIA"]
-
-    def __init__(self, root_dir, split="train", transform=None):
-        self.root_dir = Path(root_dir) / split
+    def __init__(self, root_dir, split="train", transform=None, split_csv=None):
+        self.root_dir = Path(root_dir)
         self.transform = transform
         self.samples = []
         self.labels = []
 
-        for label_idx, class_name in enumerate(self.CLASSES):
-            class_dir = self.root_dir / class_name
-            if not class_dir.exists():
-                continue
-            for img_path in sorted(class_dir.glob("*.jpeg")):
-                self.samples.append(img_path)
-                self.labels.append(label_idx)
+        if split_csv and Path(split_csv).exists():
+            with open(split_csv, newline="") as f:
+                for row in csv.DictReader(f):
+                    if row["split"] == split:
+                        self.samples.append(Path(row["path"]))
+                        self.labels.append(CLASS_NAMES.index(row["class"]))
+        else:
+            for label_idx, class_name in enumerate(CLASS_NAMES):
+                class_dir = self.root_dir / split / class_name
+                if class_dir.exists():
+                    for img_path in sorted(class_dir.glob("*.jpeg")):
+                        self.samples.append(img_path)
+                        self.labels.append(label_idx)
 
     def __len__(self):
         return len(self.samples)
@@ -85,7 +106,7 @@ class ChestXRayDataset(Dataset):
         return img, label
 
     def class_counts(self):
-        return {cls: self.labels.count(idx) for idx, cls in enumerate(self.CLASSES)}
+        return {cls: self.labels.count(idx) for idx, cls in enumerate(CLASS_NAMES)}
 
 
 def get_device():
@@ -96,8 +117,9 @@ def get_device():
     return torch.device("cpu")
 
 
-def build_transforms():
-    train_transform = transforms.Compose([
+def build_train_transform(preprocess_mode="baseline"):
+    return transforms.Compose([
+        transforms.Lambda(lambda img: apply_image_preprocessing(img, preprocess_mode)),
         transforms.Resize(256),
         transforms.RandomResizedCrop(IMG_SIZE, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
         transforms.RandomApply([
@@ -111,15 +133,16 @@ def build_transforms():
                              std=[0.229, 0.224, 0.225]),
     ])
 
-    eval_transform = transforms.Compose([
+
+def build_eval_transform(preprocess_mode="baseline"):
+    return transforms.Compose([
+        transforms.Lambda(lambda img: apply_image_preprocessing(img, preprocess_mode)),
         transforms.Resize(256),
         transforms.CenterCrop(IMG_SIZE),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
     ])
-
-    return train_transform, eval_transform
 
 
 def seed_everything(seed):
@@ -162,7 +185,24 @@ def compute_metrics(labels, preds, probs):
     return metrics
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--preprocess", choices=["baseline", "clahe", "clahe_denoise"],
+                        default="baseline",
+                        help="Image preprocessing mode applied before resize/normalization.")
+    parser.add_argument("--raw-splits", action="store_true",
+                        help="Use the original Kaggle train/val/test folders instead of the stratified split CSV.")
+    parser.add_argument("--epochs", type=int, default=EPOCHS,
+                        help=f"Maximum training epochs (default: {EPOCHS}).")
+    parser.add_argument("--patience", type=int, default=PATIENCE,
+                        help=f"Early-stopping patience (default: {PATIENCE}).")
+    parser.add_argument("--min-epochs", type=int, default=10,
+                        help="Do not early-stop before this epoch (default: 10).")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     seed_everything(SEED)
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -172,14 +212,21 @@ def main():
     num_workers = NUM_WORKERS if device.type == "cuda" else 0
     print(f"Using device: {device}")
 
-    train_transform, eval_transform = build_transforms()
+    train_transform = build_train_transform(args.preprocess)
+    eval_transform = build_eval_transform(args.preprocess)
+    split_csv = None if args.raw_splits else SPLIT_CSV
+    if split_csv and not split_csv.exists():
+        print(f"Stratified split not found at {split_csv}; falling back to raw folders.")
+        split_csv = None
 
     # --- DataLoaders ---
-    train_dataset = ChestXRayDataset(DATA_DIR, "train", train_transform)
-    val_dataset = ChestXRayDataset(DATA_DIR, "val", eval_transform)
+    train_dataset = ChestXRayDataset(DATA_DIR, "train", train_transform, split_csv=split_csv)
+    val_dataset = ChestXRayDataset(DATA_DIR, "val", eval_transform, split_csv=split_csv)
 
     print(f"Train: {len(train_dataset)} images")
     print(f"Val:   {len(val_dataset)} images")
+    print(f"Preprocessing: {args.preprocess}")
+    print(f"Split source: {'stratified CSV' if split_csv else 'raw Kaggle folders'}")
 
     if len(train_dataset) == 0 or len(val_dataset) == 0:
         raise SystemExit(
@@ -193,6 +240,7 @@ def main():
                             num_workers=num_workers, pin_memory=pin_memory)
 
     print(f"Train class counts: {train_dataset.class_counts()}")
+    print(f"Val class counts:   {val_dataset.class_counts()}")
     print("Augmentation: resize/crop, mild affine, mild contrast; no horizontal flip")
 
     # --- Model ---
@@ -213,7 +261,7 @@ def main():
          "lr": BACKBONE_LR},
         {"params": model.fc.parameters(), "lr": HEAD_LR},
     ], weight_decay=WEIGHT_DECAY)
-    scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # --- Training loop ---
     best_val_loss = float("inf")
@@ -223,9 +271,12 @@ def main():
                "train_balanced_acc": [], "val_balanced_acc": [],
                "val_precision": [], "val_recall": [], "val_f1": [], "val_auc": []}
 
-    print(f"\nTraining for up to {EPOCHS} epochs (patience={PATIENCE})...\n")
+    print(
+        f"\nTraining for up to {args.epochs} epochs "
+        f"(patience={args.patience}, min_epochs={args.min_epochs})...\n"
+    )
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(1, args.epochs + 1):
         start = time.time()
 
         # Train
@@ -233,7 +284,7 @@ def main():
         running_loss = 0.0
         all_preds, all_labels, all_probs = [], [], []
 
-        for images, labels in tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [train]"):
+        for images, labels in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]"):
             images, labels = images.to(device), labels.to(device)
             optimizer.zero_grad()
             outputs = model(images)
@@ -257,7 +308,7 @@ def main():
         all_preds, all_labels, all_probs = [], [], []
 
         with torch.no_grad():
-            for images, labels in tqdm(val_loader, desc=f"Epoch {epoch}/{EPOCHS} [val]"):
+            for images, labels in tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]"):
                 images, labels = images.to(device), labels.to(device)
                 outputs = model(images)
                 loss = criterion(outputs, labels)
@@ -285,7 +336,7 @@ def main():
         history["val_auc"].append(val_metrics["auc"])
 
         elapsed = time.time() - start
-        print(f"\nEpoch {epoch}/{EPOCHS} ({elapsed:.1f}s)")
+        print(f"\nEpoch {epoch}/{args.epochs} ({elapsed:.1f}s)")
         print(
             f"  Train - Loss: {train_loss:.4f} | Acc: {train_metrics['acc']:.4f} | "
             f"BalAcc: {train_metrics['balanced_acc']:.4f}"
@@ -316,13 +367,14 @@ def main():
                 "val_recall": val_metrics["recall"],
                 "val_f1": val_metrics["f1"],
                 "val_auc": val_metrics["auc"],
-                "class_names": ChestXRayDataset.CLASSES,
+                "class_names": CLASS_NAMES,
                 "class_counts": train_dataset.class_counts(),
                 "recommended_class_weights": class_weight_tensor.detach().cpu().tolist(),
                 "config": {
                     "img_size": IMG_SIZE,
                     "batch_size": BATCH_SIZE,
-                    "epochs": EPOCHS,
+                    "epochs": args.epochs,
+                    "min_epochs": args.min_epochs,
                     "backbone_lr": BACKBONE_LR,
                     "head_lr": HEAD_LR,
                     "weight_decay": WEIGHT_DECAY,
@@ -330,15 +382,24 @@ def main():
                     "label_smoothing": LABEL_SMOOTHING,
                     "balanced_sampler": True,
                     "horizontal_flip": False,
+                    "preprocess_mode": args.preprocess,
+                    "split_csv": str(split_csv) if split_csv else "",
+                    "stratified_split": bool(split_csv),
                     "seed": SEED,
                 },
             }, CHECKPOINT_DIR / "best_classifier.pt")
             print("  -> Saved best model")
         else:
             patience_counter += 1
-            if patience_counter >= PATIENCE:
+            can_stop = epoch >= args.min_epochs
+            if patience_counter >= args.patience and can_stop:
                 print(f"\nEarly stopping at epoch {epoch}")
                 break
+            if patience_counter >= args.patience and not can_stop:
+                print(
+                    f"  -> No improvement for {patience_counter} epoch(s), "
+                    f"but continuing until min_epochs={args.min_epochs}"
+                )
 
     # --- Save history ---
     with open(RESULTS_DIR / "training_history.json", "w") as f:
@@ -347,19 +408,19 @@ def main():
 
     # --- Save training curves ---
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    ax1.plot(history["train_loss"], label="Train")
-    ax1.plot(history["val_loss"], label="Val")
+    ax1.plot(history["train_loss"], label="Training images")
+    ax1.plot(history["val_loss"], label="Validation images")
     ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Loss")
-    ax1.set_title("Loss")
+    ax1.set_ylabel("Error/loss")
+    ax1.set_title("Learning error over time\nLower means the model is fitting better")
     ax1.legend()
 
-    ax2.plot(history["train_acc"], label="Train")
-    ax2.plot(history["val_acc"], label="Val")
-    ax2.plot(history["val_balanced_acc"], label="Val balanced")
+    ax2.plot(history["train_acc"], label="Training accuracy")
+    ax2.plot(history["val_acc"], label="Validation accuracy")
+    ax2.plot(history["val_balanced_acc"], label="Validation balanced accuracy")
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Accuracy")
-    ax2.set_title("Accuracy")
+    ax2.set_title("Correct predictions over time\nBalanced accuracy checks both classes fairly")
     ax2.legend()
 
     plt.tight_layout()
