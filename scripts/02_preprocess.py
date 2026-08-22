@@ -270,6 +270,16 @@ def main():
             json.dump(bad_images, f, indent=2)
         print(f"Saved: {RESULTS_DIR / 'bad_images.json'}")
 
+    print("\nStep 2 outputs")
+    print(f"  Output directory:       {RESULTS_DIR}")
+    print(f"  Dataset manifest:       {RESULTS_DIR / 'dataset_manifest.csv'}")
+    print(f"  Dataset summary:        {RESULTS_DIR / 'data_summary.json'}")
+    print(f"  Class distribution plot:{RESULTS_DIR / 'class_distribution.png'}")
+    print(f"  Sample image grid:      {RESULTS_DIR / 'sample_images.png'}")
+    print(f"  Pixel distribution plot:{RESULTS_DIR / 'pixel_distributions.png'}")
+    if bad_images:
+        print(f"  Bad image log:          {RESULTS_DIR / 'bad_images.json'}")
+
     print("\nDone. Run scripts/03_train_classifier.py next.")
 
 
