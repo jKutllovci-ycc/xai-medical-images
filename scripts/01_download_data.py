@@ -69,8 +69,13 @@ for split in ["train", "val", "test"]:
         else:
             print(f"  {split}/{cls}: NOT FOUND - check the extracted folder structure")
 
-print(f"\nDataset saved to: {FINAL_DIR}")
-print("If the folder structure looks wrong, manually move so it looks like:")
+print("\nStep 1 outputs")
+print(f"  Output directory: {FINAL_DIR}")
+print(f"  Train images:     {FINAL_DIR / 'train'}")
+print(f"  Validation images:{FINAL_DIR / 'val'}")
+print(f"  Test images:      {FINAL_DIR / 'test'}")
+print(f"  Download cache:   {DOWNLOAD_DIR}")
+print("\nIf the folder structure looks wrong, manually move so it looks like:")
 print("  data/raw/chest_xray/train/NORMAL/")
 print("  data/raw/chest_xray/train/PNEUMONIA/")
 print("  data/raw/chest_xray/val/...")
