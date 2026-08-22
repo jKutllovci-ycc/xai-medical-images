@@ -53,6 +53,14 @@ IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 
+def confidence_band(confidence):
+    if confidence >= 0.90:
+        return "high"
+    if confidence >= 0.70:
+        return "moderate"
+    return "borderline"
+
+
 class ChestXRayDataset(Dataset):
     def __init__(self, root_dir, split, transform):
         self.root_dir = Path(root_dir) / split
@@ -134,6 +142,7 @@ def score_test_set(model, dataset, device):
                     "pred_idx": int(pred_idx),
                     "pred_label": CLASS_NAMES[int(pred_idx)],
                     "confidence": float(prob[pred_idx]),
+                    "confidence_band": confidence_band(float(prob[pred_idx])),
                     "normal_prob": float(prob[0]),
                     "pneumonia_prob": float(prob[1]),
                     "correct": bool(pred_idx == true_idx),
@@ -324,6 +333,28 @@ def make_difference_map(original_rgb, cf_rgb):
     return diff_gray, np.clip(blended, 0, 1)
 
 
+def change_localisation_metrics(diff_gray, lung_mask, threshold=0.02):
+    lung_mask = (lung_mask > 0.5).astype(np.float32)
+    total_change = float(diff_gray.sum())
+    if total_change <= 1e-8:
+        change_inside_lung = 0.0
+    else:
+        change_inside_lung = float((diff_gray * lung_mask).sum() / total_change)
+
+    changed = diff_gray > threshold
+    if not changed.any():
+        active_inside_lung = 0.0
+    else:
+        active_inside_lung = float(lung_mask[changed].mean())
+
+    return {
+        "change_inside_lung_fraction": round(change_inside_lung, 4),
+        "change_outside_lung_fraction": round(1.0 - change_inside_lung, 4),
+        "active_change_inside_lung_fraction": round(active_inside_lung, 4),
+        "active_change_outside_lung_fraction": round(1.0 - active_inside_lung, 4),
+    }
+
+
 def save_counterfactual_panel(
     row, original_rgb, cf_rgb, diff_gray, diff_overlay, mask,
     cf_pred_label, cf_confidence, output_dir, comp_dir, idx,
@@ -488,8 +519,9 @@ def write_metadata(results, all_rows, cf_dir, comp_dir, args):
 
     fieldnames = [
         "file", "path", "true_label", "pred_label", "correct", "confidence",
-        "cf_pred_label", "cf_confidence", "cf_success", "cf_target_prob",
-        "cf_l1_norm", "cf_steps_used", "panel_path",
+        "confidence_band", "cf_pred_label", "cf_confidence", "cf_success",
+        "cf_target_prob", "cf_l1_norm", "change_inside_lung_fraction",
+        "active_change_outside_lung_fraction", "cf_steps_used", "panel_path",
     ]
     with open(cf_dir / "counterfactual_metadata.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -596,6 +628,7 @@ def main():
         cf_rgb = tensor_to_display(cf_tensor)
         original_rgb = tensor_to_display(input_tensor)
         diff_gray, diff_overlay = make_difference_map(original_rgb, cf_rgb)
+        localisation = change_localisation_metrics(diff_gray, mask_np)
 
         masked_delta_np = (best_delta * mask_tensor).detach().cpu().numpy()
         l1_norm = float(np.abs(masked_delta_np).mean())
@@ -613,6 +646,7 @@ def main():
             "cf_success": success,
             "cf_target_prob": cf_target_prob,
             "cf_l1_norm": l1_norm,
+            **localisation,
             "cf_steps_used": args.steps,
             "panel_path": str(panel_path),
             "original_rgb": original_rgb,
@@ -640,11 +674,16 @@ def main():
     print(f"\nCounterfactual generation complete.")
     print(f"  Success rate: {n_success}/{n_total} "
           f"({100 * n_success / max(n_total, 1):.0f}%)")
-    print(f"  Counterfactuals: {CF_OUTPUT_DIR}/")
-    print(f"  Comparison panels: {COMP_OUTPUT_DIR}/")
-    print(f"  Summary grid: {COMP_OUTPUT_DIR / 'counterfactual_summary_grid.png'}")
-    print(f"  Difference grid: {COMP_OUTPUT_DIR / 'counterfactual_diff_grid.png'}")
-    print(f"  Metadata: {CF_OUTPUT_DIR / 'counterfactual_metadata.json'}")
+    print("\nStep 6 outputs")
+    print(f"  Counterfactual directory: {CF_OUTPUT_DIR}")
+    print(f"  Comparison directory:     {COMP_OUTPUT_DIR}")
+    print(f"  Metadata JSON:            {CF_OUTPUT_DIR / 'counterfactual_metadata.json'}")
+    print(f"  Metadata CSV:             {CF_OUTPUT_DIR / 'counterfactual_metadata.csv'}")
+    print(f"  Summary grid:             {COMP_OUTPUT_DIR / 'counterfactual_summary_grid.png'}")
+    print(f"  Difference grid:          {COMP_OUTPUT_DIR / 'counterfactual_diff_grid.png'}")
+    print(f"  Per-image CF images:      {CF_OUTPUT_DIR / '*_counterfactual.png'}")
+    print(f"  Per-image difference maps:{CF_OUTPUT_DIR / '*_diff_map.png'}")
+    print(f"  Per-image panels:         {COMP_OUTPUT_DIR / '*_cf_panel.png'}")
 
     if n_success < n_total:
         partial = [r for r in results if not r["cf_success"]]
