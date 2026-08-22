@@ -24,6 +24,7 @@ os.environ.setdefault("XDG_CACHE_HOME", str(Path(".cache").resolve()))
 
 import matplotlib
 import numpy as np
+import cv2
 from PIL import Image, ImageOps
 
 matplotlib.use("Agg")
@@ -32,9 +33,12 @@ import matplotlib.pyplot as plt
 
 DATA_DIR = Path("data/raw/chest_xray")
 RESULTS_DIR = Path("experiments/results")
+SPLIT_DIR = Path("data/processed/splits")
+SPLIT_CSV = SPLIT_DIR / "stratified_split.csv"
 CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 SPLITS = ["train", "val", "test"]
 IMG_SIZE = 224
+SEED = 42
 
 
 def iter_images(split=None, class_name=None):
@@ -183,6 +187,109 @@ def save_manifest(rows):
     print(f"Saved: {path}")
 
 
+def build_stratified_split(rows, val_fraction=0.2, seed=SEED):
+    rng = np.random.default_rng(seed)
+    split_rows = []
+    train_val_rows = [r for r in rows if r["split"] in {"train", "val"}]
+    test_rows = [r for r in rows if r["split"] == "test"]
+
+    for cls in CLASS_NAMES:
+        class_rows = [r for r in train_val_rows if r["class"] == cls]
+        indices = np.arange(len(class_rows))
+        rng.shuffle(indices)
+        val_count = max(1, int(round(len(class_rows) * val_fraction)))
+        val_indices = set(indices[:val_count])
+        for idx, row in enumerate(class_rows):
+            split_name = "val" if idx in val_indices else "train"
+            split_rows.append({
+                "split": split_name,
+                "class": row["class"],
+                "path": row["path"],
+                "source_split": row["split"],
+                "file": row["file"],
+                "sha1": row["sha1"],
+            })
+
+    for row in test_rows:
+        split_rows.append({
+            "split": "test",
+            "class": row["class"],
+            "path": row["path"],
+            "source_split": row["split"],
+            "file": row["file"],
+            "sha1": row["sha1"],
+        })
+
+    return split_rows
+
+
+def save_stratified_split(rows):
+    SPLIT_DIR.mkdir(parents=True, exist_ok=True)
+    split_rows = build_stratified_split(rows)
+    with open(SPLIT_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["split", "class", "path", "source_split", "file", "sha1"],
+        )
+        writer.writeheader()
+        writer.writerows(split_rows)
+
+    counts = {
+        split: {cls: 0 for cls in CLASS_NAMES}
+        for split in SPLITS
+    }
+    for row in split_rows:
+        counts[row["split"]][row["class"]] += 1
+
+    with open(SPLIT_DIR / "stratified_split_summary.json", "w") as f:
+        json.dump({
+            "split_csv": str(SPLIT_CSV),
+            "seed": SEED,
+            "validation_fraction_from_train_val_pool": 0.2,
+            "official_test_set_preserved": True,
+            "counts": counts,
+            "note": (
+                "The original Kaggle validation split has only 16 images. "
+                "This split rebuilds train/val from original train+val while "
+                "leaving the official test set untouched."
+            ),
+        }, f, indent=2)
+
+    print(f"Saved: {SPLIT_CSV}")
+    print(f"Saved: {SPLIT_DIR / 'stratified_split_summary.json'}")
+
+
+def apply_clahe_preview(img):
+    gray = np.asarray(img.convert("L"))
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return Image.fromarray(clahe.apply(gray))
+
+
+def save_preprocessing_preview(rows):
+    examples = []
+    for cls in CLASS_NAMES:
+        examples.extend([r for r in rows if r["split"] == "train" and r["class"] == cls][:3])
+    if not examples:
+        return
+
+    fig, axes = plt.subplots(len(examples), 2, figsize=(8, len(examples) * 3.2))
+    axes = np.atleast_2d(axes)
+    for idx, row in enumerate(examples):
+        img = Image.open(row["path"]).convert("L").resize((IMG_SIZE, IMG_SIZE))
+        clahe_img = apply_clahe_preview(img).resize((IMG_SIZE, IMG_SIZE))
+        axes[idx, 0].imshow(img, cmap="gray")
+        axes[idx, 0].set_title(f"Original: {row['class']}", fontsize=9)
+        axes[idx, 1].imshow(clahe_img, cmap="gray")
+        axes[idx, 1].set_title("CLAHE preview", fontsize=9)
+        for ax in axes[idx]:
+            ax.axis("off")
+    plt.suptitle("Preprocessing Preview: Original vs CLAHE", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(RESULTS_DIR / "preprocessing_clahe_preview.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {RESULTS_DIR / 'preprocessing_clahe_preview.png'}")
+
+
 def save_plots(rows, summary):
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     for idx, split in enumerate(SPLITS):
@@ -259,7 +366,9 @@ def main():
     print(f"  unreadable images: {len(bad_images)}")
 
     save_manifest(rows)
+    save_stratified_split(rows)
     save_plots(rows, summary)
+    save_preprocessing_preview(rows)
 
     with open(RESULTS_DIR / "data_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -274,9 +383,11 @@ def main():
     print(f"  Output directory:       {RESULTS_DIR}")
     print(f"  Dataset manifest:       {RESULTS_DIR / 'dataset_manifest.csv'}")
     print(f"  Dataset summary:        {RESULTS_DIR / 'data_summary.json'}")
+    print(f"  Stratified split CSV:   {SPLIT_CSV}")
     print(f"  Class distribution plot:{RESULTS_DIR / 'class_distribution.png'}")
     print(f"  Sample image grid:      {RESULTS_DIR / 'sample_images.png'}")
     print(f"  Pixel distribution plot:{RESULTS_DIR / 'pixel_distributions.png'}")
+    print(f"  CLAHE preview:          {RESULTS_DIR / 'preprocessing_clahe_preview.png'}")
     if bad_images:
         print(f"  Bad image log:          {RESULTS_DIR / 'bad_images.json'}")
 
