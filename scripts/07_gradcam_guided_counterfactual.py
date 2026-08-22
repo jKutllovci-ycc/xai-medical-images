@@ -56,6 +56,14 @@ IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 
+def confidence_band(confidence):
+    if confidence >= 0.90:
+        return "high"
+    if confidence >= 0.70:
+        return "moderate"
+    return "borderline"
+
+
 class ChestXRayDataset(Dataset):
     def __init__(self, root_dir, split, transform):
         self.root_dir = Path(root_dir) / split
@@ -137,6 +145,7 @@ def score_test_set(model, dataset, device):
                     "pred_idx": int(pred_idx),
                     "pred_label": CLASS_NAMES[int(pred_idx)],
                     "confidence": float(prob[pred_idx]),
+                    "confidence_band": confidence_band(float(prob[pred_idx])),
                     "normal_prob": float(prob[0]),
                     "pneumonia_prob": float(prob[1]),
                     "correct": bool(pred_idx == true_idx),
@@ -349,6 +358,28 @@ def make_difference_map(original_rgb, cf_rgb):
     return diff_gray, np.clip(blended, 0, 1)
 
 
+def change_localisation_metrics(diff_gray, lung_mask, threshold=0.02):
+    lung_mask = (lung_mask > 0.5).astype(np.float32)
+    total_change = float(diff_gray.sum())
+    if total_change <= 1e-8:
+        change_inside_lung = 0.0
+    else:
+        change_inside_lung = float((diff_gray * lung_mask).sum() / total_change)
+
+    changed = diff_gray > threshold
+    if not changed.any():
+        active_inside_lung = 0.0
+    else:
+        active_inside_lung = float(lung_mask[changed].mean())
+
+    return {
+        "change_inside_lung_fraction": round(change_inside_lung, 4),
+        "change_outside_lung_fraction": round(1.0 - change_inside_lung, 4),
+        "active_change_inside_lung_fraction": round(active_inside_lung, 4),
+        "active_change_outside_lung_fraction": round(1.0 - active_inside_lung, 4),
+    }
+
+
 def save_guided_panel(
     row, original_rgb, gradcam_heatmap, lung_mask, guided_mask,
     cf_rgb_standard, cf_rgb_guided,
@@ -540,8 +571,11 @@ def write_metadata(results, all_rows, output_dir, args):
 
     fieldnames = [
         "file", "path", "true_label", "pred_label", "correct", "confidence",
-        "standard_cf_pred_label", "standard_cf_confidence", "standard_cf_success", "standard_l1",
+        "confidence_band", "standard_cf_pred_label", "standard_cf_confidence",
+        "standard_cf_success", "standard_l1", "standard_change_inside_lung_fraction",
+        "standard_active_change_outside_lung_fraction",
         "guided_cf_pred_label", "guided_cf_confidence", "guided_cf_success", "guided_l1",
+        "guided_change_inside_lung_fraction", "guided_active_change_outside_lung_fraction",
         "l1_reduction_pct", "guided_mask_coverage",
         "panel_path",
     ]
@@ -560,7 +594,7 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--l1-weight", type=float, default=0.008)
-    parser.add_argument("--tv-weight", type=float, default=0.003)
+    parser.add_argument("--tv-weight", type=float, default=0.006)
     parser.add_argument("--confidence-threshold", type=float, default=0.65)
     parser.add_argument("--cam-threshold", type=float, default=0.3,
                         help="Grad-CAM activation threshold for the guided mask. "
@@ -657,6 +691,8 @@ def main():
 
         std_diff_gray, std_diff_overlay = make_difference_map(original_rgb, std_cf_rgb)
         guided_diff_gray, guided_diff_overlay = make_difference_map(original_rgb, guided_cf_rgb)
+        std_localisation = change_localisation_metrics(std_diff_gray, lung_mask)
+        guided_localisation = change_localisation_metrics(guided_diff_gray, lung_mask)
 
         std_l1 = float(np.abs((std_delta * lung_mask_tensor).detach().cpu().numpy()).mean())
         guided_l1 = float(np.abs((guided_delta * guided_mask_tensor).detach().cpu().numpy()).mean())
@@ -679,10 +715,14 @@ def main():
             "standard_cf_confidence": round(std_confidence, 4),
             "standard_cf_success": std_success,
             "standard_l1": round(std_l1, 6),
+            "standard_change_inside_lung_fraction": std_localisation["change_inside_lung_fraction"],
+            "standard_active_change_outside_lung_fraction": std_localisation["active_change_outside_lung_fraction"],
             "guided_cf_pred_label": guided_pred_label,
             "guided_cf_confidence": round(guided_confidence, 4),
             "guided_cf_success": guided_success,
             "guided_l1": round(guided_l1, 6),
+            "guided_change_inside_lung_fraction": guided_localisation["change_inside_lung_fraction"],
+            "guided_active_change_outside_lung_fraction": guided_localisation["active_change_outside_lung_fraction"],
             "l1_reduction_pct": round(l1_reduction, 1),
             "guided_mask_coverage": round(guided_mask_coverage, 4),
             "panel_path": str(panel_path),
@@ -721,9 +761,15 @@ def main():
             if r["guided_cf_success"] and r["standard_cf_success"]
         ])
         print(f"  Avg L1 reduction:    {avg_reduction:.1f}% (guided vs standard)")
-    print(f"  Outputs: {OUTPUT_DIR}/")
-    print(f"  Summary: {OUTPUT_DIR / 'guided_cf_summary_grid.png'}")
-    print(f"  Comparison: {OUTPUT_DIR / 'standard_vs_guided_grid.png'}")
+    print("\nStep 7 outputs")
+    print(f"  Output directory:          {OUTPUT_DIR}")
+    print(f"  Metadata JSON:             {OUTPUT_DIR / 'guided_cf_metadata.json'}")
+    print(f"  Metadata CSV:              {OUTPUT_DIR / 'guided_cf_metadata.csv'}")
+    print(f"  Summary grid:              {OUTPUT_DIR / 'guided_cf_summary_grid.png'}")
+    print(f"  Standard vs guided grid:   {OUTPUT_DIR / 'standard_vs_guided_grid.png'}")
+    print(f"  Per-image guided panels:   {OUTPUT_DIR / '*_guided_panel.png'}")
+    print(f"  Per-image guided CF images:{OUTPUT_DIR / '*_guided_cf.png'}")
+    print(f"  Per-image guided diffs:    {OUTPUT_DIR / '*_guided_diff.png'}")
 
 
 if __name__ == "__main__":
