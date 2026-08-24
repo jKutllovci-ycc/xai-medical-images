@@ -17,6 +17,7 @@ captum>=0.7.0
 # Image quality metrics
 pytorch-fid>=0.3.0
 lpips>=0.1.4
+scikit-image>=0.21.0
 
 # Jupyter
 jupyter>=1.0.0
