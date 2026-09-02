@@ -19,6 +19,7 @@ What it does:
 
 import json
 import os
+import argparse
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(".matplotlib-cache").resolve()))
@@ -62,6 +63,13 @@ CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 CURRENT_PREPROCESS_MODE = "baseline"
+
+
+def clean_generated_outputs(directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    for path in directory.iterdir():
+        if path.is_file():
+            path.unlink()
 
 
 def trapezoid_auc(values):
@@ -533,10 +541,16 @@ def evaluate_counterfactuals(cf_dir, label):
         meta = json.load(f)
 
     results = []
-    for entry in meta.get("selected", []):
+    for idx, entry in enumerate(meta.get("selected", [])):
         path = entry.get("path", "")
         file_stem = Path(path).stem
-        cf_candidates = list(cf_dir.glob(f"*{file_stem}*_counterfactual.png"))
+        true_label = entry.get("true_label", "unknown").lower()
+        desc_stem = f"{idx + 1:02d}_{true_label}_xray"
+        cf_candidates = (
+            list(cf_dir.glob(f"*{file_stem}*_edited_to_look_*.png"))
+            or list(cf_dir.glob(f"*{file_stem}*_counterfactual.png"))
+            or list(cf_dir.glob(f"*{desc_stem}*_edited_to_look_*.png"))
+        )
         if not cf_candidates or not Path(path).exists():
             continue
 
@@ -572,10 +586,17 @@ def evaluate_guided_counterfactuals(guided_dir):
         meta = json.load(f)
 
     results = []
-    for entry in meta.get("selected", []):
+    for idx, entry in enumerate(meta.get("selected", [])):
         path = entry.get("path", "")
         file_stem = Path(path).stem
-        cf_candidates = list(guided_dir.glob(f"*{file_stem}*_guided_cf.png"))
+        true_label = entry.get("true_label", "unknown").lower()
+        desc_stem = f"{idx + 1:02d}_{true_label}_xray"
+        cf_candidates = (
+            list(guided_dir.glob(f"*{file_stem}*_guided_what_if_*.png"))
+            or list(guided_dir.glob(f"*{file_stem}*_guided_cf.png"))
+            or list(guided_dir.glob(f"*{desc_stem}*_guided_cf.png"))
+            or list(guided_dir.glob(f"*{desc_stem}*_guided_what_if_*.png"))
+        )
         if not cf_candidates or not Path(path).exists():
             continue
 
@@ -809,8 +830,21 @@ def save_insertion_deletion_curves(gradcam_results, output_dir):
     plt.close(fig)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Evaluate Grad-CAM and counterfactual explanation quality."
+    )
+    parser.add_argument("--no-clean", action="store_true",
+                        help="Keep old output files.")
+    return parser.parse_args()
+
+
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    args = parse_args()
+    if args.no_clean:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    else:
+        clean_generated_outputs(OUTPUT_DIR)
 
     device = get_device()
     print(f"Using device: {device}")
