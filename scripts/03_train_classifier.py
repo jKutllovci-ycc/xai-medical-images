@@ -44,13 +44,13 @@ from tqdm import tqdm
 IMG_SIZE = 224
 BATCH_SIZE = 32
 NUM_WORKERS = 4
-EPOCHS = 25
+EPOCHS = 30
 BACKBONE_LR = 0.00005
 HEAD_LR = 0.0003
 WEIGHT_DECAY = 0.0001
 DROPOUT = 0.3
 NUM_CLASSES = 2
-PATIENCE = 5
+PATIENCE = 8
 LABEL_SMOOTHING = 0.05
 SEED = 42
 
@@ -196,8 +196,8 @@ def parse_args():
                         help=f"Maximum training epochs (default: {EPOCHS}).")
     parser.add_argument("--patience", type=int, default=PATIENCE,
                         help=f"Early-stopping patience (default: {PATIENCE}).")
-    parser.add_argument("--min-epochs", type=int, default=10,
-                        help="Do not early-stop before this epoch (default: 10).")
+    parser.add_argument("--min-epochs", type=int, default=15,
+                        help="Do not early-stop before this epoch (default: 15).")
     return parser.parse_args()
 
 
@@ -255,7 +255,7 @@ def main():
 
     # --- Training setup ---
     class_weight_tensor = make_class_weight_tensor(train_dataset.labels, device)
-    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    criterion = nn.CrossEntropyLoss(weight=class_weight_tensor, label_smoothing=LABEL_SMOOTHING)
     optimizer = torch.optim.AdamW([
         {"params": [p for name, p in model.named_parameters() if not name.startswith("fc.")],
          "lr": BACKBONE_LR},
