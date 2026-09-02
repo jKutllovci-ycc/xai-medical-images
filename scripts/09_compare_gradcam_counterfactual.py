@@ -19,6 +19,7 @@ What it does:
 
 import json
 import os
+import argparse
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(".matplotlib-cache").resolve()))
@@ -41,6 +42,13 @@ COMP_DIR = Path("outputs/comparisons")
 GUIDED_CF_DIR = Path("outputs/guided_counterfactuals")
 QUALITY_DIR = Path("outputs/explanation_quality")
 OUTPUT_DIR = Path("outputs/gradcam_vs_counterfactual")
+
+
+def clean_generated_outputs(directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    for path in directory.iterdir():
+        if path.is_file():
+            path.unlink()
 
 
 def load_json(path):
@@ -68,15 +76,30 @@ def find_matching_files():
         guided_files = {e["file"]: e for e in guided_meta.get("selected", [])}
 
     common = set(gc_files.keys()) & set(cf_files.keys())
-    return sorted(common), gc_files, cf_files, guided_files
+    desc_stems = build_desc_stems(gradcam_meta.get("selected", []))
+    desc_stems.update(build_desc_stems(cf_meta.get("selected", [])))
+    if guided_meta:
+        desc_stems.update(build_desc_stems(guided_meta.get("selected", [])))
+    return sorted(common), gc_files, cf_files, guided_files, desc_stems
 
 
-def find_image(directory, file_stem, suffixes):
-    for suffix in suffixes:
-        candidates = list(directory.glob(f"*{file_stem}*{suffix}"))
-        if candidates:
-            return candidates[0]
+def find_image(directory, stems, suffixes):
+    if isinstance(stems, str):
+        stems = [stems]
+    for stem in stems:
+        for suffix in suffixes:
+            candidates = list(directory.glob(f"*{stem}*{suffix}"))
+            if candidates:
+                return candidates[0]
     return None
+
+
+def build_desc_stems(metadata_selected):
+    mapping = {}
+    for idx, entry in enumerate(metadata_selected):
+        true_label = entry.get("true_label", "unknown").lower()
+        mapping[entry["file"]] = f"{idx + 1:02d}_{true_label}_xray"
+    return mapping
 
 
 def load_resized(path):
@@ -110,9 +133,10 @@ def compute_overlap(gradcam_path, diff_path):
 
 def save_detailed_panel(
     filename, gc_entry, cf_entry, guided_entry,
-    overlap_score, output_dir, idx,
+    overlap_score, output_dir, idx, desc_stems,
 ):
     file_stem = Path(filename).stem
+    stems = [file_stem, desc_stems.get(filename, "")]
     true_label = gc_entry.get("true_label", "?")
     pred_label = gc_entry.get("pred_label", "?")
     confidence = gc_entry.get("confidence", 0)
@@ -121,18 +145,18 @@ def save_detailed_panel(
     original_path = gc_entry.get("path", "")
     original = load_resized(Path(original_path)) if original_path else np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
 
-    gc_overlay = load_resized(find_image(GRADCAM_DIR, file_stem, ["_overlay.png"]))
-    gc_heatmap = load_resized(find_image(GRADCAM_DIR, file_stem, ["_heatmap.png"]))
+    gc_overlay = load_resized(find_image(GRADCAM_DIR, stems, ["_where_model_looked.png", "_overlay.png"]))
+    gc_heatmap = load_resized(find_image(GRADCAM_DIR, stems, ["_focus_heatmap.png", "_heatmap.png"]))
 
-    cf_image = load_resized(find_image(CF_DIR, file_stem, ["_counterfactual.png"]))
-    cf_diff = load_resized(find_image(CF_DIR, file_stem, ["_diff_map.png"]))
+    cf_image = load_resized(find_image(CF_DIR, stems, ["_edited_to_look_pneumonia.png", "_edited_to_look_normal.png", "_counterfactual.png"]))
+    cf_diff = load_resized(find_image(CF_DIR, stems, ["_what_changed.png", "_diff_map.png"]))
 
     has_guided = bool(guided_entry)
     guided_cf = load_resized(
-        find_image(GUIDED_CF_DIR, file_stem, ["_guided_cf.png"])
+        find_image(GUIDED_CF_DIR, stems, ["_guided_what_if_pneumonia.png", "_guided_what_if_normal.png", "_guided_cf.png"])
     ) if has_guided else None
     guided_diff = load_resized(
-        find_image(GUIDED_CF_DIR, file_stem, ["_guided_diff.png"])
+        find_image(GUIDED_CF_DIR, stems, ["_guided_what_changed.png", "_guided_diff.png"])
     ) if has_guided else None
 
     n_cols = 7 if has_guided else 5
@@ -165,9 +189,9 @@ def save_detailed_panel(
     cf_status = "flipped" if cf_success else "partial"
     axes[3].imshow(cf_image)
     axes[3].set_title(
-        "4. Changed X-ray\n"
-        "Synthetic edited image\n"
-        f"New prediction: {cf_label} ({cf_conf:.3f})",
+        "4. Counterfactual image\n"
+        "Synthetic edit, not clinical truth\n"
+        f"Model now predicts: {cf_label} ({cf_conf:.3f})",
         fontsize=10,
     )
 
@@ -187,9 +211,9 @@ def save_detailed_panel(
 
         axes[5].imshow(guided_cf)
         axes[5].set_title(
-            "6. Focused changed X-ray\n"
+            "6. Guided counterfactual\n"
             "Focused synthetic edit\n"
-            f"New prediction: {g_label} ({g_conf:.3f})",
+            f"Model now predicts: {g_label} ({g_conf:.3f})",
             fontsize=10,
         )
 
@@ -220,13 +244,13 @@ def save_detailed_panel(
         wrap=True,
     )
     plt.tight_layout(rect=[0, 0.10, 1, 0.90])
-    panel_path = output_dir / f"{idx:02d}_{file_stem}_comparison.png"
+    panel_path = output_dir / f"{idx + 1:02d}_{true_label.lower()}_xray_gradcam_vs_counterfactual.png"
     plt.savefig(panel_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
     return panel_path
 
 
-def save_master_grid(results, output_dir):
+def save_master_grid(results, output_dir, desc_stems):
     if not results:
         return
 
@@ -238,18 +262,19 @@ def save_master_grid(results, output_dir):
 
     headers = ["Original", "Model Focus", "Normal Changes", "Focused Changes", "Agreement"]
     if not has_guided:
-        headers = ["Original", "Model Focus", "Changed X-ray", "Needed Changes"]
+        headers = ["Original", "Model Focus", "Counterfactual", "Needed Changes"]
 
     for col, header in enumerate(headers[:n_cols]):
         axes[0, col].set_title(header, fontsize=10, fontweight="bold")
 
     for row_idx, r in enumerate(results):
         file_stem = Path(r["file"]).stem
+        stems = [file_stem, desc_stems.get(r["file"], "")]
 
         original_path = r.get("path", "")
         original = load_resized(Path(original_path)) if original_path else np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
-        gc_overlay = load_resized(find_image(GRADCAM_DIR, file_stem, ["_overlay.png"]))
-        cf_diff = load_resized(find_image(CF_DIR, file_stem, ["_diff_map.png"]))
+        gc_overlay = load_resized(find_image(GRADCAM_DIR, stems, ["_where_model_looked.png", "_overlay.png"]))
+        cf_diff = load_resized(find_image(CF_DIR, stems, ["_what_changed.png", "_diff_map.png"]))
 
         axes[row_idx, 0].imshow(original)
         status = "OK" if r.get("correct", False) else "MISS"
@@ -264,7 +289,7 @@ def save_master_grid(results, output_dir):
             axes[row_idx, 2].imshow(cf_diff)
 
             guided_diff = load_resized(
-                find_image(GUIDED_CF_DIR, file_stem, ["_guided_diff.png"])
+                find_image(GUIDED_CF_DIR, stems, ["_guided_what_changed.png", "_guided_diff.png"])
             )
             axes[row_idx, 3].imshow(guided_diff)
 
@@ -275,7 +300,7 @@ def save_master_grid(results, output_dir):
             axes[row_idx, 4].text(overlap + 0.02, 0, f"{overlap:.2f}", va="center", fontsize=9)
             axes[row_idx, 4].set_yticks([])
         else:
-            cf_image = load_resized(find_image(CF_DIR, file_stem, ["_counterfactual.png"]))
+            cf_image = load_resized(find_image(CF_DIR, stems, ["_edited_to_look_pneumonia.png", "_edited_to_look_normal.png", "_counterfactual.png"]))
             axes[row_idx, 2].imshow(cf_image)
             axes[row_idx, 3].imshow(cf_diff)
 
@@ -288,6 +313,86 @@ def save_master_grid(results, output_dir):
     plt.suptitle(title, fontsize=13, y=0.99)
     plt.tight_layout(rect=[0.06, 0, 1, 0.97])
     plt.savefig(output_dir / "master_comparison_grid.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_paired_normal_vs_pneumonia(results, gc_files, cf_files, output_dir, desc_stems):
+    normal_results = [
+        r for r in results
+        if r.get("correct") and r["true_label"] == "NORMAL"
+        and r.get("cf_success")
+    ]
+    pneumonia_results = [
+        r for r in results
+        if r.get("correct") and r["true_label"] == "PNEUMONIA"
+        and r.get("cf_success")
+    ]
+    n_pairs = min(len(normal_results), len(pneumonia_results), 3)
+    if n_pairs == 0:
+        return
+
+    fig, axes = plt.subplots(n_pairs, 4, figsize=(20, n_pairs * 4.8))
+    axes = np.atleast_2d(axes)
+
+    for i in range(n_pairs):
+        nr = normal_results[i]
+        pr = pneumonia_results[i]
+        nr_stems = [Path(nr["file"]).stem, desc_stems.get(nr["file"], "")]
+        pr_stems = [Path(pr["file"]).stem, desc_stems.get(pr["file"], "")]
+
+        nr_orig = load_resized(Path(nr["path"])) if nr.get("path") else np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
+        nr_cf = load_resized(find_image(CF_DIR, nr_stems, ["_edited_to_look_pneumonia.png", "_counterfactual.png"]))
+        pr_orig = load_resized(Path(pr["path"])) if pr.get("path") else np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
+        pr_cf = load_resized(find_image(CF_DIR, pr_stems, ["_edited_to_look_normal.png", "_counterfactual.png"]))
+
+        axes[i, 0].imshow(nr_orig)
+        axes[i, 0].set_title(
+            "This is a NORMAL chest X-ray\n"
+            f"Model confidence: {nr.get('confidence', 0):.2f}",
+            fontsize=9, fontweight="bold",
+        )
+
+        axes[i, 1].imshow(nr_cf)
+        axes[i, 1].set_title(
+            "This is how PNEUMONIA\nwould look on this X-ray\n"
+            f"(model prediction: {cf_files.get(nr['file'], {}).get('cf_pred_label', '?')})",
+            fontsize=9,
+        )
+
+        axes[i, 2].imshow(pr_orig)
+        axes[i, 2].set_title(
+            "This is a PNEUMONIA chest X-ray\n"
+            f"Model confidence: {pr.get('confidence', 0):.2f}",
+            fontsize=9, fontweight="bold",
+        )
+
+        axes[i, 3].imshow(pr_cf)
+        axes[i, 3].set_title(
+            "This is how NORMAL\nwould look on this X-ray\n"
+            f"(model prediction: {cf_files.get(pr['file'], {}).get('cf_pred_label', '?')})",
+            fontsize=9,
+        )
+
+        for ax in axes[i]:
+            ax.axis("off")
+
+    fig.suptitle(
+        "NORMAL vs PNEUMONIA: How the model sees the difference\n"
+        "Left pair: normal X-ray and how pneumonia would look  |  "
+        "Right pair: pneumonia X-ray and how normal would look",
+        fontsize=12, y=0.99,
+    )
+    fig.text(
+        0.5, 0.02,
+        "These are synthetic counterfactual explanations showing what the trained model is sensitive to. "
+        "They are not medically verified diagnoses.",
+        ha="center", va="bottom", fontsize=10, wrap=True,
+    )
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+    plt.savefig(
+        output_dir / "normal_vs_pneumonia_side_by_side.png",
+        dpi=180, bbox_inches="tight",
+    )
     plt.close(fig)
 
 
@@ -322,10 +427,23 @@ def save_overlap_chart(results, output_dir):
     plt.close(fig)
 
 
-def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compare Grad-CAM and counterfactual explanation outputs."
+    )
+    parser.add_argument("--no-clean", action="store_true",
+                        help="Keep old output files.")
+    return parser.parse_args()
 
-    common_files, gc_files, cf_files, guided_files = find_matching_files()
+
+def main():
+    args = parse_args()
+    if args.no_clean:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    else:
+        clean_generated_outputs(OUTPUT_DIR)
+
+    common_files, gc_files, cf_files, guided_files, desc_stems = find_matching_files()
     print(f"Found {len(common_files)} images with both Grad-CAM and CF outputs")
     if guided_files:
         guided_common = set(common_files) & set(guided_files.keys())
@@ -338,13 +456,14 @@ def main():
         guided_entry = guided_files.get(filename)
 
         file_stem = Path(filename).stem
-        gc_heatmap_path = find_image(GRADCAM_DIR, file_stem, ["_heatmap.png"])
-        cf_diff_path = find_image(CF_DIR, file_stem, ["_diff_map.png"])
+        stems = [file_stem, desc_stems.get(filename, "")]
+        gc_heatmap_path = find_image(GRADCAM_DIR, stems, ["_focus_heatmap.png", "_heatmap.png"])
+        cf_diff_path = find_image(CF_DIR, stems, ["_what_changed.png", "_diff_map.png"])
         overlap = compute_overlap(gc_heatmap_path, cf_diff_path)
 
         panel_path = save_detailed_panel(
             filename, gc_entry, cf_entry, guided_entry,
-            overlap, OUTPUT_DIR, idx,
+            overlap, OUTPUT_DIR, idx, desc_stems,
         )
 
         result = {
@@ -367,7 +486,8 @@ def main():
         results.append(result)
         print(f"  [{idx + 1}/{len(common_files)}] {filename} — overlap={overlap:.2f}")
 
-    save_master_grid(results, OUTPUT_DIR)
+    save_master_grid(results, OUTPUT_DIR, desc_stems)
+    save_paired_normal_vs_pneumonia(results, gc_files, cf_files, OUTPUT_DIR, desc_stems)
     save_overlap_chart(results, OUTPUT_DIR)
 
     quality_data = load_json(QUALITY_DIR / "explanation_quality.json")
@@ -406,7 +526,7 @@ def main():
     print(f"  Master grid:            {OUTPUT_DIR / 'master_comparison_grid.png'}")
     print(f"  Overlap chart:          {OUTPUT_DIR / 'overlap_analysis.png'}")
     print(f"  Per-image comparisons:  {OUTPUT_DIR / '*_comparison.png'}")
-    print(f"\nDone! Run 10_generate_report.py next.")
+    print(f"\nDone! Review notebooks/results.ipynb for the full explanation and findings.")
 
 
 if __name__ == "__main__":
