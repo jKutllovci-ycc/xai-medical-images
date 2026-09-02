@@ -213,8 +213,7 @@ def select_examples(rows, max_per_class):
             key=lambda r: (r["correct"], r["true_class_prob"]),
         )
 
-        quota_easy = max(1, max_per_class // 2)
-        candidates = correct[:quota_easy] + hard[:max_per_class]
+        candidates = correct[:max_per_class] + hard[:max_per_class]
         count = 0
         for row in candidates:
             if row["path"] in seen:
@@ -253,7 +252,8 @@ def load_selected_examples(path):
             row["true_idx"] = int(row["true_idx"])
             row["pred_idx"] = int(row["pred_idx"])
             for key in ["confidence", "normal_prob", "pneumonia_prob", "true_class_prob"]:
-                row[key] = float(row[key])
+                if key in row and row[key] != "":
+                    row[key] = float(row[key])
             row["correct"] = str(row["correct"]).lower() == "true"
             rows.append(row)
     return rows
@@ -370,41 +370,41 @@ def make_overlay(rgb, cam, threshold=0.18, alpha=0.65):
 
 def save_single_result(row, rgb, cam, mask, overlay, output_dir, idx):
     true_label = row["true_label"].lower()
-    stem = f"{idx:02d}_{true_label}_{Path(row['path']).stem}"
+    stem = f"{idx + 1:02d}_{true_label}_xray"
 
-    plt.imsave(output_dir / f"{stem}_heatmap.png", cam, cmap="turbo", vmin=0, vmax=1)
-    plt.imsave(output_dir / f"{stem}_mask.png", mask, cmap="gray", vmin=0, vmax=1)
-    Image.fromarray(overlay).save(output_dir / f"{stem}_overlay.png")
+    plt.imsave(output_dir / f"{stem}_focus_heatmap.png", cam, cmap="turbo", vmin=0, vmax=1)
+    plt.imsave(output_dir / f"{stem}_lung_area.png", mask, cmap="gray", vmin=0, vmax=1)
+    Image.fromarray(overlay).save(output_dir / f"{stem}_where_model_looked.png")
 
     fig, axes = plt.subplots(1, 4, figsize=(19, 5.8))
     axes[0].imshow(rgb)
     axes[0].set_title(
-        "1. Original X-ray\n"
+        f"1. Original chest X-ray\n"
         f"True label: {row['true_label']}",
         fontsize=10,
     )
     axes[1].imshow(mask, cmap="gray", vmin=0, vmax=1)
     axes[1].set_title(
-        "2. Estimated lung area\n"
-        "White = lung/chest area\nBlack = ignored background",
+        "2. Lung area\n"
+        "White = lung region\nBlack = ignored background",
         fontsize=10,
     )
     axes[2].imshow(cam, cmap="turbo", vmin=0, vmax=1)
     axes[2].set_title(
-        "3. Model focus map\n"
-        "Bright colors = stronger focus\nDark = little focus",
+        "3. Where the model focused\n"
+        "Bright colors = strong focus\nDark = little focus",
         fontsize=10,
     )
     axes[3].imshow(overlay)
     axes[3].set_title(
-        "4. Focus drawn on X-ray\n"
+        "4. Focus highlighted on X-ray\n"
         f"Model predicted: {row['pred_label']} ({row['confidence']:.3f})",
         fontsize=10,
     )
     for ax in axes:
         ax.axis("off")
     fig.suptitle(
-        f"Where the model looked for {Path(row['path']).name}",
+        f"Where did the model look when predicting {row['pred_label']} for this {row['true_label']} X-ray?",
         fontsize=12,
         y=0.98,
     )
@@ -419,7 +419,7 @@ def save_single_result(row, rgb, cam, mask, overlay, output_dir, idx):
         wrap=True,
     )
     plt.tight_layout(rect=[0, 0.09, 1, 0.90])
-    panel_path = output_dir / f"{stem}_panel.png"
+    panel_path = output_dir / f"{stem}_gradcam_explanation.png"
     plt.savefig(panel_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
     return panel_path
@@ -428,8 +428,8 @@ def save_single_result(row, rgb, cam, mask, overlay, output_dir, idx):
 def save_comparison_result(row, rgb, legacy_overlay, improved_overlay, mask,
                            output_dir, idx):
     true_label = row["true_label"].lower()
-    stem = f"{idx:02d}_{true_label}_{Path(row['path']).stem}"
-    comparison_path = output_dir / f"{stem}_legacy_vs_improved.png"
+    stem = f"{idx + 1:02d}_{true_label}_xray"
+    comparison_path = output_dir / f"{stem}_old_vs_new_focus.png"
 
     fig, axes = plt.subplots(1, 4, figsize=(18, 5.5))
     axes[0].imshow(rgb)
