@@ -185,7 +185,7 @@ def parse_args():
     parser.add_argument(
         "--threshold-mode",
         choices=["specificity", "balanced"],
-        default="balanced",
+        default="specificity",
         help=(
             "specificity protects NORMAL cases by requiring stronger pneumonia evidence; "
             "balanced maximises validation balanced accuracy."
