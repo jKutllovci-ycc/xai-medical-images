@@ -11,8 +11,8 @@ What it does:
       produce diffuse, hard-to-interpret changes spread across the whole image
     - This script first computes a Grad-CAM++ heatmap to find WHERE the model is
       looking, then restricts the counterfactual perturbation to ONLY those regions
-    - Result: smaller, more focused perturbations that change only the pixels the
-      model actually uses for its decision — much easier to interpret clinically
+    - Result: smaller, more focused perturbations that target pixels the model
+      uses for its decision, making the model-sensitivity explanation easier to inspect
     - Saves side-by-side panels comparing standard vs guided counterfactuals
 """
 
@@ -222,8 +222,7 @@ def select_examples(rows, max_per_class):
             class_rows,
             key=lambda r: (r["correct"], r["confidence"]),
         )
-        quota_easy = max(1, max_per_class // 2)
-        candidates = correct[:quota_easy] + hard[:max_per_class]
+        candidates = correct[:max_per_class] + hard[:max_per_class]
         count = 0
         for row in candidates:
             if row["path"] in seen:
@@ -386,14 +385,37 @@ def total_variation_loss(x):
 
 def generate_counterfactual(
     model, input_tensor, source_class, target_class, mask_tensor,
-    device, steps, lr, l1_weight, tv_weight, confidence_threshold,
+    device, steps, lr, l1_weight, tv_weight, confidence_threshold, delta_limit,
+    delta_resolution,
 ):
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
 
-    delta = torch.zeros_like(input_tensor, device=device, requires_grad=True)
-    optimizer = torch.optim.Adam([delta], lr=lr)
+    if delta_resolution and delta_resolution < input_tensor.shape[-1]:
+        delta_shape = (
+            input_tensor.shape[0], 1,
+            delta_resolution, delta_resolution,
+        )
+        delta_param = torch.zeros(delta_shape, device=device, requires_grad=True)
+    else:
+        delta_param = torch.zeros_like(input_tensor, device=device, requires_grad=True)
+
+    def upsample_delta():
+        if delta_param.shape[-1] == input_tensor.shape[-1]:
+            delta_up = delta_param
+        else:
+            delta_up = F.interpolate(
+            delta_param,
+            size=input_tensor.shape[-2:],
+            mode="bicubic",
+            align_corners=False,
+        )
+        if delta_up.shape[1] == 1:
+            delta_up = delta_up.expand_as(input_tensor)
+        return delta_up
+
+    optimizer = torch.optim.Adam([delta_param], lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
 
     best_delta = None
@@ -402,6 +424,7 @@ def generate_counterfactual(
 
     for step in range(steps):
         optimizer.zero_grad()
+        delta = upsample_delta()
         cf_input = clamp_normalized(input_tensor + delta * mask_tensor)
         logits = model(cf_input)
         probs = F.softmax(logits, dim=1)
@@ -419,16 +442,39 @@ def generate_counterfactual(
         scheduler.step()
 
         with torch.no_grad():
-            delta.data.clamp_(-0.5, 0.5)
+            delta_param.data.clamp_(-delta_limit, delta_limit)
 
         current_prob = target_prob.item()
         if current_prob > best_cf_prob:
             best_cf_prob = current_prob
-            best_delta = delta.detach().clone()
+            best_delta = upsample_delta().detach().clone()
             best_loss = loss.item()
 
     success = best_cf_prob >= 0.5
     return best_delta, success, best_cf_prob, best_loss
+
+
+def apply_counterfactual_delta(input_tensor, delta, mask_tensor, effect_strength):
+    return clamp_normalized(input_tensor + effect_strength * delta * mask_tensor)
+
+
+def choose_display_counterfactual(
+    model, input_tensor, delta, mask_tensor, target_class,
+    decision_threshold, max_effect_strength,
+):
+    strengths = np.linspace(max_effect_strength, 1.0, 16)
+    fallback = None
+    for strength in strengths:
+        cf_tensor = apply_counterfactual_delta(input_tensor, delta, mask_tensor, float(strength))
+        logits = model(cf_tensor)
+        probs = F.softmax(logits, dim=1).cpu().numpy()[0]
+        pred_idx = predict_label_from_probs(probs, decision_threshold)
+        if fallback is None:
+            fallback = (cf_tensor, probs, pred_idx, float(strength))
+        if pred_idx == target_class:
+            return cf_tensor, probs, pred_idx, float(strength), True
+    cf_tensor, probs, pred_idx, strength = fallback
+    return cf_tensor, probs, pred_idx, strength, False
 
 
 def denormalize(tensor):
@@ -484,7 +530,8 @@ def save_guided_panel(
     output_dir, idx,
 ):
     true_label = row["true_label"].lower()
-    stem = f"{idx:02d}_{true_label}_{Path(row['path']).stem}"
+    target_label = "pneumonia" if row["pred_idx"] == 0 else "normal"
+    stem = f"{idx + 1:02d}_{true_label}_xray"
 
     fig, axes = plt.subplots(2, 4, figsize=(24, 11.5))
 
@@ -519,9 +566,9 @@ def save_guided_panel(
 
     axes[1, 0].imshow(cf_rgb_standard)
     axes[1, 0].set_title(
-        "5. Changed X-ray\n"
-        "Synthetic image after edits anywhere in lung area\n"
-        f"New prediction: {cf_label_std} ({cf_conf_std:.3f})",
+        "5. Standard counterfactual\n"
+        "Synthetic edit, not a clinical diagnosis\n"
+        f"Model now predicts: {cf_label_std} ({cf_conf_std:.3f})",
         fontsize=10,
     )
 
@@ -534,9 +581,9 @@ def save_guided_panel(
 
     axes[1, 2].imshow(cf_rgb_guided)
     axes[1, 2].set_title(
-        "7. Focused changed X-ray\n"
-        "Synthetic image after focused edits\n"
-        f"New prediction: {cf_label_guided} ({cf_conf_guided:.3f})",
+        "7. Guided counterfactual\n"
+        "Synthetic focused edit\n"
+        f"Model now predicts: {cf_label_guided} ({cf_conf_guided:.3f})",
         fontsize=10,
     )
 
@@ -559,23 +606,23 @@ def save_guided_panel(
         0.5,
         0.035,
         "How to read this: both rows ask what small changes would make the model switch its answer. "
-        "The normal version may change any allowed chest area. The focused version tries to change only the "
-        "areas the model was already looking at, so the explanation should be easier to understand.",
+        "The counterfactual image is not medically verified as normal or pneumonia. It shows what changes "
+        "the trained model is sensitive to; the focused version pushes those changes toward Grad-CAM regions.",
         ha="center",
         va="bottom",
         fontsize=10,
         wrap=True,
     )
     plt.tight_layout(rect=[0, 0.08, 1, 0.93])
-    panel_path = output_dir / f"{stem}_guided_panel.png"
+    panel_path = output_dir / f"{stem}_guided_explanation.png"
     plt.savefig(panel_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
     Image.fromarray(np.uint8(cf_rgb_guided * 255)).save(
-        output_dir / f"{stem}_guided_cf.png"
+        output_dir / f"{stem}_guided_what_if_{target_label}.png"
     )
     plt.imsave(
-        output_dir / f"{stem}_guided_diff.png",
+        output_dir / f"{stem}_guided_what_changed.png",
         diff_guided[..., :3] if diff_guided.ndim == 3 else diff_guided,
         cmap="turbo" if diff_guided.ndim == 2 else None,
     )
@@ -608,7 +655,7 @@ def save_summary_grid(results, output_dir):
 
         axes[i, 2].imshow(r["guided_cf_rgb"])
         axes[i, 2].set_title(
-            f"Focused changed image:\n{r['guided_cf_pred_label']} ({r['guided_cf_confidence']:.2f})",
+            f"Model now predicts:\n{r['guided_cf_pred_label']} ({r['guided_cf_confidence']:.2f})",
             fontsize=8,
         )
 
@@ -695,6 +742,8 @@ def write_metadata(results, all_rows, output_dir, args):
         "l1_weight": args.l1_weight,
         "tv_weight": args.tv_weight,
         "confidence_threshold": args.confidence_threshold,
+        "delta_limit": args.delta_limit,
+        "effect_strength": args.effect_strength,
         "max_per_class": args.max_per_class,
         "preprocess_mode": results[0].get("preprocess_mode", "") if results else "",
         "selected_examples_csv": str(SELECTED_CSV),
@@ -714,12 +763,14 @@ def write_metadata(results, all_rows, output_dir, args):
     fieldnames = [
         "file", "path", "true_label", "pred_label", "correct", "confidence",
         "confidence_band", "standard_cf_pred_label", "standard_cf_confidence",
-        "standard_cf_success", "standard_l1", "standard_change_inside_lung_fraction",
+        "standard_cf_success", "standard_l1", "standard_effect_strength_used",
+        "standard_change_inside_lung_fraction",
         "standard_active_change_outside_lung_fraction",
         "guided_cf_pred_label", "guided_cf_confidence", "guided_cf_success", "guided_l1",
-        "guided_change_inside_lung_fraction", "guided_active_change_outside_lung_fraction",
-        "l1_reduction_pct", "guided_mask_coverage",
-        "panel_path",
+        "guided_effect_strength_used", "guided_change_inside_lung_fraction",
+        "guided_active_change_outside_lung_fraction",
+        "l1_reduction_pct", "guided_mask_coverage", "effect_strength",
+        "delta_limit", "delta_resolution", "panel_path",
     ]
     with open(output_dir / "guided_cf_metadata.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -735,9 +786,14 @@ def parse_args():
     parser.add_argument("--max-per-class", type=int, default=6)
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=0.01)
-    parser.add_argument("--l1-weight", type=float, default=0.008)
-    parser.add_argument("--tv-weight", type=float, default=0.006)
+    parser.add_argument("--l1-weight", type=float, default=0.004)
+    parser.add_argument("--tv-weight", type=float, default=0.02)
     parser.add_argument("--confidence-threshold", type=float, default=0.65)
+    parser.add_argument("--delta-limit", type=float, default=1.0)
+    parser.add_argument("--effect-strength", type=float, default=3.0,
+                        help="Amplifies the learned perturbation in saved counterfactual images.")
+    parser.add_argument("--delta-resolution", type=int, default=56,
+                        help="Lower values produce smoother, broader visual edits.")
     parser.add_argument("--cam-threshold", type=float, default=0.3,
                         help="Grad-CAM activation threshold for the guided mask. "
                              "Lower = wider mask (more pixels allowed to change).")
@@ -814,27 +870,31 @@ def main():
         std_delta, std_success, std_prob, _ = generate_counterfactual(
             model, input_tensor, source_class, target_class, lung_mask_tensor,
             device, args.steps, args.lr, args.l1_weight, args.tv_weight,
-            args.confidence_threshold,
+            args.confidence_threshold, args.delta_limit, args.delta_resolution,
         )
 
         guided_delta, guided_success, guided_prob, _ = generate_counterfactual(
             model, input_tensor, source_class, target_class, guided_mask_tensor,
             device, args.steps, args.lr, args.l1_weight, args.tv_weight,
-            args.confidence_threshold,
+            args.confidence_threshold, args.delta_limit, args.delta_resolution,
         )
 
         with torch.no_grad():
-            std_cf_tensor = clamp_normalized(input_tensor + std_delta * lung_mask_tensor)
-            std_logits = model(std_cf_tensor)
-            std_probs = F.softmax(std_logits, dim=1).cpu().numpy()[0]
-            std_pred_idx = predict_label_from_probs(std_probs, decision_threshold)
+            std_cf_tensor, std_probs, std_pred_idx, std_strength_used, std_display_success = (
+                choose_display_counterfactual(
+                    model, input_tensor, std_delta, lung_mask_tensor, target_class,
+                    decision_threshold, args.effect_strength,
+                )
+            )
             std_confidence = float(std_probs[std_pred_idx])
             std_pred_label = CLASS_NAMES[std_pred_idx]
 
-            guided_cf_tensor = clamp_normalized(input_tensor + guided_delta * guided_mask_tensor)
-            guided_logits = model(guided_cf_tensor)
-            guided_probs = F.softmax(guided_logits, dim=1).cpu().numpy()[0]
-            guided_pred_idx = predict_label_from_probs(guided_probs, decision_threshold)
+            guided_cf_tensor, guided_probs, guided_pred_idx, guided_strength_used, guided_display_success = (
+                choose_display_counterfactual(
+                    model, input_tensor, guided_delta, guided_mask_tensor, target_class,
+                    decision_threshold, args.effect_strength,
+                )
+            )
             guided_confidence = float(guided_probs[guided_pred_idx])
             guided_pred_label = CLASS_NAMES[guided_pred_idx]
 
@@ -847,8 +907,12 @@ def main():
         std_localisation = change_localisation_metrics(std_diff_gray, lung_mask)
         guided_localisation = change_localisation_metrics(guided_diff_gray, lung_mask)
 
-        std_l1 = float(np.abs((std_delta * lung_mask_tensor).detach().cpu().numpy()).mean())
-        guided_l1 = float(np.abs((guided_delta * guided_mask_tensor).detach().cpu().numpy()).mean())
+        std_l1 = float(np.abs((
+            std_strength_used * std_delta * lung_mask_tensor
+        ).detach().cpu().numpy()).mean())
+        guided_l1 = float(np.abs((
+            guided_strength_used * guided_delta * guided_mask_tensor
+        ).detach().cpu().numpy()).mean())
         l1_reduction = (1 - guided_l1 / max(std_l1, 1e-8)) * 100
 
         guided_mask_coverage = float(guided_mask.sum()) / max(float(lung_mask.sum()), 1)
@@ -866,18 +930,23 @@ def main():
             **row,
             "standard_cf_pred_label": std_pred_label,
             "standard_cf_confidence": round(std_confidence, 4),
-            "standard_cf_success": std_success,
+            "standard_cf_success": bool(std_display_success),
             "standard_l1": round(std_l1, 6),
+            "standard_effect_strength_used": round(std_strength_used, 3),
             "standard_change_inside_lung_fraction": std_localisation["change_inside_lung_fraction"],
             "standard_active_change_outside_lung_fraction": std_localisation["active_change_outside_lung_fraction"],
             "guided_cf_pred_label": guided_pred_label,
             "guided_cf_confidence": round(guided_confidence, 4),
-            "guided_cf_success": guided_success,
+            "guided_cf_success": bool(guided_display_success),
             "guided_l1": round(guided_l1, 6),
+            "guided_effect_strength_used": round(guided_strength_used, 3),
             "guided_change_inside_lung_fraction": guided_localisation["change_inside_lung_fraction"],
             "guided_active_change_outside_lung_fraction": guided_localisation["active_change_outside_lung_fraction"],
             "l1_reduction_pct": round(l1_reduction, 1),
             "guided_mask_coverage": round(guided_mask_coverage, 4),
+            "effect_strength": args.effect_strength,
+            "delta_limit": args.delta_limit,
+            "delta_resolution": args.delta_resolution,
             "preprocess_mode": preprocess_mode,
             "panel_path": str(panel_path),
             "original_rgb": original_rgb,
@@ -889,8 +958,8 @@ def main():
         }
         results.append(result)
 
-        g_status = "FLIPPED" if guided_success else "PARTIAL"
-        s_status = "FLIPPED" if std_success else "PARTIAL"
+        g_status = "FLIPPED" if guided_display_success else "PARTIAL"
+        s_status = "FLIPPED" if std_display_success else "PARTIAL"
         print(
             f"  [{g_status}] {row['file']}: "
             f"standard L1={std_l1:.4f} [{s_status}], "
