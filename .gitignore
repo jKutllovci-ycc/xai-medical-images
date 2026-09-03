@@ -1,19 +1,6 @@
-data/
-outputs/
-experiments/results/
-experiments/checkpoints/*.pt
-experiments/checkpoints/*.pth
 __pycache__/
 *.pyc
 .matplotlib-cache/
-.DS_Store
-*.jpeg
-*.jpg
-*.png
-*.tif
-*.tiff
-*.bmp
-*.gif
 .ipynb_checkpoints/
 *.egg-info/
 dist/
@@ -21,3 +8,15 @@ build/
 .env
 wandb/
 *.log
+.jupyter/
+.local/
+.ipython/
+.cache/
+data/
+
+# Keep generated dissertation evidence in the repository.
+!outputs/
+!outputs/**
+!experiments/results/
+!experiments/results/**
+.DS_Store

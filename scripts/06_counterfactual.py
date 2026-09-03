@@ -30,6 +30,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
 from tqdm import tqdm
@@ -213,16 +215,26 @@ def select_examples(rows, max_per_class):
     seen = set()
     for class_idx, class_name in enumerate(CLASS_NAMES):
         class_rows = [r for r in rows if r["true_idx"] == class_idx]
-        correct = sorted(
-            [r for r in class_rows if r["correct"]],
+        correct = [r for r in class_rows if r["correct"]]
+
+        # Prefer moderately confident correct predictions (0.85-0.97)
+        # These produce the most realistic and achievable counterfactuals
+        moderate = sorted(
+            [r for r in correct if 0.85 <= r["confidence"] <= 0.97],
             key=lambda r: r["confidence"],
             reverse=True,
         )
+        # Fallback to high confidence if not enough moderate ones
+        high = sorted(
+            [r for r in correct if r["confidence"] > 0.97],
+            key=lambda r: r["confidence"],
+        )
+        # Also include some borderline cases
         hard = sorted(
             class_rows,
             key=lambda r: (r["correct"], r["confidence"]),
         )
-        candidates = correct[:max_per_class] + hard[:max_per_class]
+        candidates = moderate + high + hard[:max_per_class]
         count = 0
         for row in candidates:
             if row["path"] in seen:
@@ -483,6 +495,19 @@ def smooth_noise(seed, size=IMG_SIZE):
     return noise
 
 
+def compute_pneumonia_attention(model, input_tensor, device):
+    for p in model.parameters():
+        p.requires_grad_(True)
+    target_layers = [model.layer4[-1]]
+    targets = [ClassifierOutputTarget(1)]
+    with torch.enable_grad():
+        with GradCAM(model=model, target_layers=target_layers) as cam:
+            grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return grayscale_cam[0]
+
+
 _REF_CACHE = {}
 
 def load_normal_reference():
@@ -511,7 +536,8 @@ def load_pneumonia_reference():
     return _REF_CACHE["pneumonia"]
 
 
-def semantic_edit(original_rgb, lung_mask, target_class, strength, seed):
+def semantic_edit(original_rgb, lung_mask, target_class, strength, seed,
+                  pneumonia_attention=None):
     gray = original_rgb.mean(axis=2)
     mask = cv2.GaussianBlur(lung_mask.astype(np.float32), (0, 0), sigmaX=4)
     mask = np.clip(mask, 0, 1)
@@ -522,172 +548,202 @@ def semantic_edit(original_rgb, lung_mask, target_class, strength, seed):
     texture2 = smooth_noise(seed + 7)
 
     if target_class == 1:
-        # Add pneumonia: focal patchy consolidation + ground-glass opacity
-        # NOT uniform blur — real pneumonia has distinct affected vs clear areas
+        # Normal → Pneumonia: subtle, realistic opacity increase
+        # Real pneumonia = slight haze that partially obscures lung markings,
+        # NOT solid white patches. Ribs/vessels stay visible through the haze.
         ref_p = load_pneumonia_reference()
         ref_n = load_normal_reference()
         rng = np.random.default_rng(seed)
 
-        # --- Dense consolidation patches (focal, bright white, sharp-edged) ---
-        consolidation = np.zeros_like(gray)
-
-        # Place 3-5 consolidation foci in anatomically plausible locations
-        # Prefer lower lobes (most common in bacterial pneumonia)
-        lobe_centers = [
-            (0.30, 0.60), (0.70, 0.58),  # lower lobes L/R
-            (0.28, 0.42), (0.72, 0.42),  # mid lobes L/R
-            (0.35, 0.30), (0.65, 0.30),  # upper lobes L/R
-        ]
-        rng.shuffle(lobe_centers)
-        n_foci = rng.integers(2, 5)
-        for i in range(n_foci):
-            cx, cy = lobe_centers[i]
-            cx += rng.uniform(-0.06, 0.06)
-            cy += rng.uniform(-0.05, 0.05)
-            # Irregular shape via multiple overlapping ellipses
-            for _ in range(rng.integers(2, 5)):
-                dcx = cx + rng.uniform(-0.04, 0.04)
-                dcy = cy + rng.uniform(-0.04, 0.04)
-                sx = rng.uniform(0.008, 0.025)
-                sy = rng.uniform(0.010, 0.030)
-                blob = np.exp(-(((xx - dcx) ** 2) / sx + ((yy - dcy) ** 2) / sy))
-                consolidation += rng.uniform(0.6, 1.0) * blob
-
-        consolidation = np.clip(consolidation, 0, 1)
-        # Sharpen consolidation edges (real consolidation has relatively sharp borders)
-        consolidation = np.where(consolidation > 0.15, consolidation, consolidation * 0.3)
-
-        # --- Ground-glass opacity around consolidation (lighter, semi-transparent) ---
-        ggo = cv2.GaussianBlur(consolidation, (0, 0), sigmaX=12)
-        ggo = np.clip(ggo * 1.5, 0, 0.6) * (0.5 + 0.5 * texture)
-
-        # --- Data-driven spatial weighting (where pneumonia typically appears) ---
-        if ref_p is not None and ref_n is not None:
-            diff_map = np.clip(ref_p["mean_map"] - ref_n["mean_map"], 0, 1)
-            spatial_weight = np.clip(diff_map * 10.0, 0.2, 1.0)
-        else:
-            spatial_weight = np.clip((yy - 0.15) / 0.50, 0.2, 1.0)
-
-        # Combine: focal consolidation + surrounding ground-glass
-        opacity = mask * spatial_weight * np.clip(consolidation + ggo, 0, 1)
-        opacity = np.clip(opacity * strength, 0, 0.95)
-
-        # --- Apply the pneumonia effect ---
         edited = original_rgb.copy()
 
-        # Consolidation areas: bright white (fluid-filled alveoli)
-        consol_mask = (consolidation > 0.25)[..., None]
-        consol_strength = np.clip(consolidation, 0, 1)[..., None] * opacity[..., None]
-        white_target = 0.82 + 0.05 * texture2[..., None]
-        edited = edited * (1 - consol_strength * 0.85) + white_target * (consol_strength * 0.85)
+        # --- Build smooth opacity map (where haze appears) ---
+        opacity_map = np.zeros_like(gray)
 
-        # Only blur WITHIN consolidated areas (not the whole lung)
-        blurred = cv2.GaussianBlur(edited, (0, 0), sigmaX=2.0)
-        blur_mask = np.clip(consolidation * 1.5, 0, 1)[..., None] * opacity[..., None]
-        edited = edited * (1 - blur_mask * 0.7) + blurred * (blur_mask * 0.7)
+        right_lobes = [
+            (0.30, 0.35, 0.09, 0.12),
+            (0.32, 0.50, 0.10, 0.13),
+            (0.28, 0.65, 0.12, 0.15),
+        ]
+        left_lobes = [
+            (0.68, 0.38, 0.09, 0.12),
+            (0.70, 0.62, 0.11, 0.14),
+        ]
+        if rng.random() < 0.5:
+            primary, secondary = right_lobes, left_lobes
+        else:
+            primary, secondary = left_lobes, right_lobes
 
-        # Ground-glass areas: lighter haze, ribs still partially visible
-        ggo_only = np.clip(ggo - consolidation * 0.5, 0, 1)[..., None] * opacity[..., None]
-        ggo_target = 0.65 + 0.08 * texture2[..., None]
-        edited = edited * (1 - ggo_only * 0.50) + ggo_target * (ggo_only * 0.50)
+        n_primary = rng.integers(1, min(3, len(primary)) + 1)
+        for li in rng.choice(len(primary), size=n_primary, replace=False):
+            cx, cy, bx, by = primary[li]
+            for _ in range(rng.integers(3, 6)):
+                dcx = cx + rng.uniform(-bx, bx)
+                dcy = cy + rng.uniform(-by, by)
+                sx = rng.uniform(0.020, 0.060)
+                sy = rng.uniform(0.025, 0.065)
+                blob = np.exp(-(((xx - dcx) ** 2) / sx + ((yy - dcy) ** 2) / sy))
+                opacity_map += rng.uniform(0.5, 0.8) * blob
+
+        if rng.random() < 0.4:
+            si = rng.integers(0, len(secondary))
+            cx, cy, bx, by = secondary[si]
+            for _ in range(rng.integers(1, 3)):
+                dcx = cx + rng.uniform(-bx * 0.5, bx * 0.5)
+                dcy = cy + rng.uniform(-by * 0.5, by * 0.5)
+                sx = rng.uniform(0.015, 0.035)
+                sy = rng.uniform(0.018, 0.040)
+                blob = np.exp(-(((xx - dcx) ** 2) / sx + ((yy - dcy) ** 2) / sy))
+                opacity_map += rng.uniform(0.2, 0.4) * blob
+
+        opacity_map = np.clip(opacity_map, 0, 1)
+        # Heavy blur for smooth, natural transitions (no sharp edges)
+        opacity_map = cv2.GaussianBlur(opacity_map, (0, 0), sigmaX=10)
+
+        # Blend amount: subtle — max ~30% brightness lift, scaled by strength
+        blend = np.clip(opacity_map * strength * 0.04, 0, 0.30) * mask
+
+        # Texture variation so the haze isn't uniform
+        haze_texture = 0.85 + 0.15 * texture
+
+        # The haze target: slightly brighter than current pixel, not white
+        # Real pneumonia raises brightness by ~15-30%, not to pure white
+        for c in range(3):
+            local = edited[:, :, c]
+            haze_target = np.clip(local + 0.20 * haze_texture, 0, 0.85)
+            edited[:, :, c] = local * (1 - blend) + haze_target * blend
+
     else:
-        # Remove pneumonia → produce a realistic normal chest X-ray
-        # Uses data-driven patterns from normal and pneumonia dataset references
+        # Pneumonia → Normal: gently darken hazy areas, preserve everything
         ref_n = load_normal_reference()
-        ref_p = load_pneumonia_reference()
 
-        # --- Detect pneumonia opacity using data + image analysis ---
-        # 1. Data-driven: where current image looks more like pneumonia than normal
-        if ref_p is not None and ref_n is not None:
-            diff_map = ref_p["mean_map"] - ref_n["mean_map"]
-            # Regions where image exceeds normal reference = likely pneumonia opacity
-            excess = gray - ref_n["mean_map"]
-            data_indicator = np.clip(excess / np.maximum(diff_map, 0.02), 0, 1.5)
-            data_indicator = np.clip(data_indicator * 0.7, 0, 1)
+        edited = original_rgb.copy()
+
+        if pneumonia_attention is not None:
+            attn = pneumonia_attention.copy()
+            attn = cv2.GaussianBlur(attn, (0, 0), sigmaX=5)
+            attn = np.clip(attn, 0, 1)
         else:
-            data_indicator = np.zeros_like(gray)
+            attn = np.ones_like(gray)
 
-        # 2. Low local contrast = haze (pneumonia blurs out ribs/vessels)
-        local_mean = cv2.GaussianBlur(gray, (0, 0), sigmaX=6)
-        local_sq = cv2.GaussianBlur(gray ** 2, (0, 0), sigmaX=6)
-        local_std = np.sqrt(np.maximum(local_sq - local_mean ** 2, 0))
-        haze_indicator = np.clip((0.15 - local_std) / 0.10, 0, 1)
-
-        # 3. Bright areas within lung = consolidation/fluid
-        lung_values = gray[mask > 0.3]
-        if lung_values.size > 0:
-            p10 = np.percentile(lung_values, 10)
-        else:
-            p10 = 0.25
-        bright_indicator = np.clip((gray - p10) / 0.18, 0, 1)
-
-        # Combine all detectors
-        opacity = np.clip(
-            data_indicator * 0.5 + haze_indicator * 0.6 + bright_indicator * 0.4,
-            0, 1,
-        )
-
-        # Emphasise lower and mid lung zones
-        lower_emphasis = np.clip((yy - 0.15) / 0.45, 0, 1)
-        mid_emphasis = np.exp(-((yy - 0.45) ** 2) / 0.10)
-        zone_weight = 0.30 + 0.45 * lower_emphasis + 0.25 * mid_emphasis
-        clearing = mask * opacity * zone_weight
-        clearing = cv2.GaussianBlur(clearing, (0, 0), sigmaX=5)
-        clearing = np.clip(clearing * strength, 0, 0.95)
-
-        # --- Target: real normal lung appearance from the dataset ---
+        # How much brighter is each pixel vs expected normal?
         if ref_n is not None:
-            # Normal reference with spatial structure preserved
-            target = ref_n["mean_map"] - 0.3 * ref_n["std_map"]
-            target = np.clip(target, 0, 1)
-            # Add subtle structural variation from reference std
-            target = target + ref_n["std_map"] * 0.10 * texture
+            expected = ref_n["mean_map"]
         else:
-            target = np.full_like(gray, 0.35) + 0.02 * texture
+            expected = np.full_like(gray, 0.35)
+        excess = np.clip(gray - expected, 0, 1)
 
-        # Ensure target is darker than current pneumonia pixels (clearing effect)
-        if lung_values.size > 0:
-            own_dark = np.percentile(lung_values, 12)
-            target = np.minimum(target, own_dark + 0.03)
+        # Target only truly hazy areas (attention + excess brightness)
+        darken_map = np.clip(attn * 0.5 + excess * 1.5, 0, 1) * mask
+        darken_map = cv2.GaussianBlur(darken_map, (0, 0), sigmaX=5)
+        darken_amount = np.clip(darken_map * strength * 0.06, 0, 0.35)
 
-        # Step 1: Clear haze toward normal reference
-        blend = clearing * 0.80
-        cleared_gray = gray * (1 - blend) + target * blend
-
-        # Step 2: Strong CLAHE to reveal ribs, vessels, bronchial structures
-        cleared_uint8 = np.clip(cleared_gray * 255, 0, 255).astype(np.uint8)
-        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(cleared_uint8).astype(np.float32) / 255.0
-        clahe_blend = clearing * 0.65
-        cleared_gray = cleared_gray * (1 - clahe_blend) + enhanced * clahe_blend
-
-        # Step 3: Sharpen to reveal rib borders and vessel walls
-        sharp_kernel = np.array([[0, -0.5, 0], [-0.5, 3.0, -0.5], [0, -0.5, 0]])
-        sharpened = cv2.filter2D(cleared_gray, -1, sharp_kernel)
-        sharp_blend = clearing * 0.40
-        cleared_gray = cleared_gray * (1 - sharp_blend) + sharpened * sharp_blend
-
-        edited = np.repeat(np.clip(cleared_gray, 0, 1)[..., None], 3, axis=2)
+        # Reduce brightness proportionally (preserves texture/detail)
+        for c in range(3):
+            edited[:, :, c] = edited[:, :, c] * (1 - darken_amount * 0.7)
 
     return np.clip(edited, 0, 1)
 
 
+def refine_with_gradient(model, cf_tensor, mask_tensor, target_class, device,
+                         decision_threshold, steps=500, lr=0.015):
+    for p in model.parameters():
+        p.requires_grad_(False)
+    with torch.enable_grad():
+        delta_small = torch.zeros(
+            (1, 1, 56, 56), device=device, requires_grad=True,
+        )
+        optimizer = torch.optim.Adam([delta_small], lr=lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
+        best_delta_small = None
+        best_target_prob = 0.0
+        for step in range(steps):
+            optimizer.zero_grad()
+            delta = F.interpolate(
+                delta_small, size=cf_tensor.shape[-2:],
+                mode="bicubic", align_corners=False,
+            ).expand_as(cf_tensor)
+            refined = clamp_normalized(cf_tensor + delta * mask_tensor)
+            logits = model(refined)
+            probs = F.softmax(logits, dim=1)
+            target_prob = probs[0, target_class]
+            masked_delta = delta * mask_tensor
+            loss = (
+                -torch.log(target_prob + 1e-8)
+                + 0.01 * masked_delta.abs().mean()
+                + 0.02 * total_variation_loss(masked_delta)
+            )
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            with torch.no_grad():
+                delta_small.data.clamp_(-0.8, 0.8)
+            if target_prob.item() > best_target_prob:
+                best_target_prob = target_prob.item()
+                best_delta_small = delta_small.detach().clone()
+    with torch.no_grad():
+        delta = F.interpolate(
+            best_delta_small, size=cf_tensor.shape[-2:],
+            mode="bicubic", align_corners=False,
+        ).expand_as(cf_tensor)
+        refined = clamp_normalized(cf_tensor + delta * mask_tensor)
+        logits = model(refined)
+        probs = F.softmax(logits, dim=1).cpu().numpy()[0]
+    pred_idx = predict_label_from_probs(probs, decision_threshold)
+    return refined, probs, pred_idx
+
+
 def choose_semantic_counterfactual(
     model, original_rgb, mask_np, target_class, device, decision_threshold,
-    max_strength, seed,
+    max_strength, seed, input_tensor=None,
 ):
-    fallback = None
-    for strength in np.linspace(max_strength, 0.15, 18):
-        cf_rgb = semantic_edit(original_rgb, mask_np, target_class, float(strength), seed)
+    pneumonia_attention = None
+    if target_class == 0 and input_tensor is not None:
+        pneumonia_attention = compute_pneumonia_attention(model, input_tensor, device)
+
+    mask_tensor = (
+        torch.from_numpy(mask_np)
+        .unsqueeze(0).unsqueeze(0)
+        .expand(1, 3, -1, -1)
+        .to(device)
+    )
+
+    best_flipped = None
+    best_partial = None
+    for strength in np.linspace(max_strength, 0.15, 28):
+        cf_rgb = semantic_edit(
+            original_rgb, mask_np, target_class, float(strength), seed,
+            pneumonia_attention=pneumonia_attention,
+        )
         cf_tensor = display_to_tensor(cf_rgb, device)
         logits = model(cf_tensor)
         probs = F.softmax(logits, dim=1).detach().cpu().numpy()[0]
         pred_idx = predict_label_from_probs(probs, decision_threshold)
-        if fallback is None:
-            fallback = (cf_tensor, probs, pred_idx, float(strength), cf_rgb)
+        target_conf = float(probs[target_class])
         if pred_idx == target_class:
-            return cf_tensor, probs, pred_idx, float(strength), cf_rgb, True
-    cf_tensor, probs, pred_idx, strength, cf_rgb = fallback
+            if best_flipped is None or target_conf > best_flipped[1][target_class]:
+                best_flipped = (cf_tensor, probs, pred_idx, float(strength), cf_rgb)
+        if best_partial is None or target_conf > best_partial[1][target_class]:
+            best_partial = (cf_tensor, probs, pred_idx, float(strength), cf_rgb)
+
+    if best_flipped is not None:
+        cf_tensor, probs, pred_idx, strength, cf_rgb = best_flipped
+        return cf_tensor, probs, pred_idx, strength, cf_rgb, True
+
+    # Gradient refinement: take the best semantic edit and fine-tune with gradients
+    cf_tensor, probs, pred_idx, strength, cf_rgb = best_partial
+    refined_tensor, refined_probs, refined_pred = refine_with_gradient(
+        model, cf_tensor.detach().clone(), mask_tensor, target_class,
+        device, decision_threshold,
+    )
+    if refined_pred == target_class:
+        cf_rgb = tensor_to_display(refined_tensor)
+        return refined_tensor, refined_probs, refined_pred, strength, cf_rgb, True
+
+    # Return whichever has higher target probability
+    if refined_probs[target_class] > probs[target_class]:
+        cf_rgb = tensor_to_display(refined_tensor)
+        return refined_tensor, refined_probs, refined_pred, strength, cf_rgb, False
     return cf_tensor, probs, pred_idx, strength, cf_rgb, False
 
 
@@ -1058,7 +1114,7 @@ def parse_args():
                         help="Lower values produce smoother, broader visual edits.")
     parser.add_argument("--pixel-counterfactual", action="store_true",
                         help="Use unconstrained optimized pixel perturbations instead of semantic grayscale edits.")
-    parser.add_argument("--semantic-strength", type=float, default=4.0,
+    parser.add_argument("--semantic-strength", type=float, default=12.0,
                         help="Maximum strength for semantic pneumonia/normal visual edits.")
     parser.add_argument("--no-clean", action="store_true",
                         help="Keep old output files.")
@@ -1165,6 +1221,7 @@ def main():
                 ) = choose_semantic_counterfactual(
                     model, original_rgb, mask_np, target_class, device,
                     decision_threshold, args.semantic_strength, seed,
+                    input_tensor=input_tensor,
                 )
                 cf_target_prob = float(cf_probs[target_class])
             cf_confidence = float(cf_probs[cf_pred_idx])
