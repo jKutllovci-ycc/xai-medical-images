@@ -219,7 +219,7 @@ def select_examples(rows, max_per_class):
             key=lambda r: r["confidence"], reverse=True,
         )
         hard = sorted(
-            class_rows,
+            correct,
             key=lambda r: (r["correct"], r["confidence"]),
         )
         candidates = correct[:max_per_class] + hard[:max_per_class]
@@ -272,8 +272,11 @@ def resolve_selected_examples(all_rows, selected_csv, max_per_class, force_resel
     if not force_reselect:
         selected = load_selected_examples(selected_csv)
         if selected:
-            available = {r["path"] for r in all_rows}
-            if all(r["path"] in available for r in selected):
+            available = {r["path"]: r for r in all_rows}
+            if all(r["path"] in available and available[r["path"]]["correct"]
+                   for r in selected):
+                selected = [available[r["path"]] for r in selected]
+                write_selected_examples(selected, selected_csv)
                 return selected
     selected = select_examples(all_rows, max_per_class)
     write_selected_examples(selected, selected_csv)
@@ -412,7 +415,9 @@ def generate_counterfactual(
             align_corners=False,
         )
         if delta_up.shape[1] == 1:
-            delta_up = delta_up.expand_as(input_tensor)
+            delta_up = delta_up.expand_as(input_tensor) * (
+                0.225 / IMAGENET_STD.to(device).unsqueeze(0)
+            )
         return delta_up
 
     optimizer = torch.optim.Adam([delta_param], lr=lr)
@@ -447,7 +452,7 @@ def generate_counterfactual(
         current_prob = target_prob.item()
         if current_prob > best_cf_prob:
             best_cf_prob = current_prob
-            best_delta = upsample_delta().detach().clone()
+            best_delta = delta.detach().clone()
             best_loss = loss.item()
 
     success = best_cf_prob >= 0.5
@@ -786,13 +791,13 @@ def parse_args():
     parser.add_argument("--max-per-class", type=int, default=6)
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=0.01)
-    parser.add_argument("--l1-weight", type=float, default=0.004)
-    parser.add_argument("--tv-weight", type=float, default=0.02)
+    parser.add_argument("--l1-weight", type=float, default=0.04)
+    parser.add_argument("--tv-weight", type=float, default=0.3)
     parser.add_argument("--confidence-threshold", type=float, default=0.65)
     parser.add_argument("--delta-limit", type=float, default=1.0)
-    parser.add_argument("--effect-strength", type=float, default=3.0,
+    parser.add_argument("--effect-strength", type=float, default=1.0,
                         help="Amplifies the learned perturbation in saved counterfactual images.")
-    parser.add_argument("--delta-resolution", type=int, default=56,
+    parser.add_argument("--delta-resolution", type=int, default=16,
                         help="Lower values produce smoother, broader visual edits.")
     parser.add_argument("--cam-threshold", type=float, default=0.3,
                         help="Grad-CAM activation threshold for the guided mask. "
@@ -848,7 +853,7 @@ def main():
             .unsqueeze(0).to(device)
         )
 
-        source_class = row["pred_idx"]
+        source_class = row["true_idx"]
         target_class = 1 - source_class
 
         gradcam_heatmap, gradcam_mask = compute_gradcam_mask(
