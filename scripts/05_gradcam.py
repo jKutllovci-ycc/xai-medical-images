@@ -209,7 +209,7 @@ def select_examples(rows, max_per_class):
             reverse=True,
         )
         hard = sorted(
-            class_rows,
+            correct,
             key=lambda r: (r["correct"], r["true_class_prob"]),
         )
 
@@ -263,8 +263,13 @@ def resolve_selected_examples(all_rows, selected_csv, max_per_class, force_resel
     if not force_reselect:
         selected = load_selected_examples(selected_csv)
         if selected:
-            available = {r["path"] for r in all_rows}
-            if all(r["path"] in available for r in selected):
+            available = {r["path"]: r for r in all_rows}
+            if all(r["path"] in available and available[r["path"]]["correct"]
+                   for r in selected) and all(
+                       sum(r["true_idx"] == c for r in selected) == max_per_class
+                       for c in range(NUM_CLASSES)):
+                selected = [available[r["path"]] for r in selected]
+                write_selected_examples(selected, selected_csv)
                 return selected
     selected = select_examples(all_rows, max_per_class)
     write_selected_examples(selected, selected_csv)
