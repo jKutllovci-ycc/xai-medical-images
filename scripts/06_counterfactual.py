@@ -231,7 +231,7 @@ def select_examples(rows, max_per_class):
         )
         # Also include some borderline cases
         hard = sorted(
-            class_rows,
+            correct,
             key=lambda r: (r["correct"], r["confidence"]),
         )
         candidates = moderate + high + hard[:max_per_class]
@@ -284,8 +284,13 @@ def resolve_selected_examples(all_rows, selected_csv, max_per_class, force_resel
     if not force_reselect:
         selected = load_selected_examples(selected_csv)
         if selected:
-            available = {r["path"] for r in all_rows}
-            if all(r["path"] in available for r in selected):
+            available = {r["path"]: r for r in all_rows}
+            if all(r["path"] in available and available[r["path"]]["correct"]
+                   for r in selected) and all(
+                       sum(r["true_idx"] == c for r in selected) == max_per_class
+                       for c in range(NUM_CLASSES)):
+                selected = [available[r["path"]] for r in selected]
+                write_selected_examples(selected, selected_csv)
                 return selected
     selected = select_examples(all_rows, max_per_class)
     write_selected_examples(selected, selected_csv)
@@ -356,7 +361,7 @@ def make_lung_field_mask(rgb):
     kept = cv2.dilate(kept, np.ones((19, 19), np.uint8), iterations=1)
     kept = cv2.morphologyEx(kept, cv2.MORPH_CLOSE, np.ones((17, 17), np.uint8))
     kept = cv2.bitwise_and(kept, body)
-    return kept.astype(np.float32) / 255.0
+    return cv2.GaussianBlur(kept.astype(np.float32) / 255.0, (0, 0), 3)
 
 
 def total_variation_loss(x):
@@ -394,7 +399,10 @@ def generate_counterfactual(
             align_corners=False,
         )
         if delta_up.shape[1] == 1:
-            delta_up = delta_up.expand_as(input_tensor)
+            # Equal intensity changes require compensating for RGB normalization.
+            delta_up = delta_up.expand_as(input_tensor) * (
+                0.225 / IMAGENET_STD.to(device).unsqueeze(0)
+            )
         return delta_up
 
     optimizer = torch.optim.Adam([delta_param], lr=lr)
@@ -433,7 +441,7 @@ def generate_counterfactual(
         current_target_prob = target_prob.item()
         if current_target_prob > best_cf_prob:
             best_cf_prob = current_target_prob
-            best_delta = upsample_delta().detach().clone()
+            best_delta = delta.detach().clone()
             best_loss = loss.item()
 
         if current_target_prob >= confidence_threshold and not flipped:
@@ -548,11 +556,7 @@ def semantic_edit(original_rgb, lung_mask, target_class, strength, seed,
     texture2 = smooth_noise(seed + 7)
 
     if target_class == 1:
-        # Normal → Pneumonia: subtle, realistic opacity increase
-        # Real pneumonia = slight haze that partially obscures lung markings,
-        # NOT solid white patches. Ribs/vessels stay visible through the haze.
-        ref_p = load_pneumonia_reference()
-        ref_n = load_normal_reference()
+        # Synthetic opacity illustration, not a clinically validated disease model.
         rng = np.random.default_rng(seed)
 
         edited = original_rgb.copy()
@@ -597,20 +601,17 @@ def semantic_edit(original_rgb, lung_mask, target_class, strength, seed,
                 opacity_map += rng.uniform(0.2, 0.4) * blob
 
         opacity_map = np.clip(opacity_map, 0, 1)
-        # Heavy blur for smooth, natural transitions (no sharp edges)
-        opacity_map = cv2.GaussianBlur(opacity_map, (0, 0), sigmaX=10)
+        opacity_map = cv2.GaussianBlur(opacity_map, (0, 0), sigmaX=5)
 
-        # Blend amount: subtle — max ~30% brightness lift, scaled by strength
-        blend = np.clip(opacity_map * strength * 0.04, 0, 0.30) * mask
+        # Retain source texture while making the added opacity visible.
+        blend = np.clip(opacity_map * strength * 0.055, 0, 0.65) * mask
 
         # Texture variation so the haze isn't uniform
-        haze_texture = 0.85 + 0.15 * texture
+        haze_texture = 0.65 + 0.25 * texture + 0.10 * texture2
 
-        # The haze target: slightly brighter than current pixel, not white
-        # Real pneumonia raises brightness by ~15-30%, not to pure white
         for c in range(3):
             local = edited[:, :, c]
-            haze_target = np.clip(local + 0.20 * haze_texture, 0, 0.85)
+            haze_target = local + 0.55 * haze_texture * (1 - local)
             edited[:, :, c] = local * (1 - blend) + haze_target * blend
 
     else:
@@ -646,23 +647,25 @@ def semantic_edit(original_rgb, lung_mask, target_class, strength, seed,
 
 
 def refine_with_gradient(model, cf_tensor, mask_tensor, target_class, device,
-                         decision_threshold, steps=500, lr=0.015):
+                         decision_threshold, steps=500, lr=0.01,
+                         delta_resolution=16, tv_weight=0.3, l1_weight=0.04):
     for p in model.parameters():
         p.requires_grad_(False)
     with torch.enable_grad():
         delta_small = torch.zeros(
-            (1, 1, 56, 56), device=device, requires_grad=True,
+            (1, 1, delta_resolution, delta_resolution), device=device, requires_grad=True,
         )
         optimizer = torch.optim.Adam([delta_small], lr=lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
         best_delta_small = None
         best_target_prob = 0.0
+        channel_scale = 0.225 / IMAGENET_STD.to(device).unsqueeze(0)
         for step in range(steps):
             optimizer.zero_grad()
             delta = F.interpolate(
                 delta_small, size=cf_tensor.shape[-2:],
                 mode="bicubic", align_corners=False,
-            ).expand_as(cf_tensor)
+            ).expand_as(cf_tensor) * channel_scale
             refined = clamp_normalized(cf_tensor + delta * mask_tensor)
             logits = model(refined)
             probs = F.softmax(logits, dim=1)
@@ -670,22 +673,25 @@ def refine_with_gradient(model, cf_tensor, mask_tensor, target_class, device,
             masked_delta = delta * mask_tensor
             loss = (
                 -torch.log(target_prob + 1e-8)
-                + 0.01 * masked_delta.abs().mean()
-                + 0.02 * total_variation_loss(masked_delta)
+                + l1_weight * masked_delta.abs().mean()
+                + tv_weight * total_variation_loss(masked_delta)
             )
+            if target_prob.item() > best_target_prob:
+                best_target_prob = target_prob.item()
+                best_delta_small = delta_small.detach().clone()
+            required = max(decision_threshold + 0.03, 0.70) if target_class else max(1 - decision_threshold + 0.03, 0.70)
+            if target_prob.item() >= min(required, 0.99):
+                break
             loss.backward()
             optimizer.step()
             scheduler.step()
             with torch.no_grad():
                 delta_small.data.clamp_(-0.8, 0.8)
-            if target_prob.item() > best_target_prob:
-                best_target_prob = target_prob.item()
-                best_delta_small = delta_small.detach().clone()
     with torch.no_grad():
         delta = F.interpolate(
             best_delta_small, size=cf_tensor.shape[-2:],
             mode="bicubic", align_corners=False,
-        ).expand_as(cf_tensor)
+        ).expand_as(cf_tensor) * channel_scale
         refined = clamp_normalized(cf_tensor + delta * mask_tensor)
         logits = model(refined)
         probs = F.softmax(logits, dim=1).cpu().numpy()[0]
@@ -696,6 +702,7 @@ def refine_with_gradient(model, cf_tensor, mask_tensor, target_class, device,
 def choose_semantic_counterfactual(
     model, original_rgb, mask_np, target_class, device, decision_threshold,
     max_strength, seed, input_tensor=None,
+    steps=500, lr=0.01, delta_resolution=16, tv_weight=0.3, l1_weight=0.04,
 ):
     pneumonia_attention = None
     if target_class == 0 and input_tensor is not None:
@@ -710,7 +717,8 @@ def choose_semantic_counterfactual(
 
     best_flipped = None
     best_partial = None
-    for strength in np.linspace(max_strength, 0.15, 28):
+    min_strength = max_strength * 0.6 if target_class == 1 else 0.15
+    for strength in np.linspace(max_strength, min_strength, 28):
         cf_rgb = semantic_edit(
             original_rgb, mask_np, target_class, float(strength), seed,
             pneumonia_attention=pneumonia_attention,
@@ -721,6 +729,8 @@ def choose_semantic_counterfactual(
         pred_idx = predict_label_from_probs(probs, decision_threshold)
         target_conf = float(probs[target_class])
         if pred_idx == target_class:
+            if target_class == 1:
+                return cf_tensor, probs, pred_idx, float(strength), cf_rgb, True
             if best_flipped is None or target_conf > best_flipped[1][target_class]:
                 best_flipped = (cf_tensor, probs, pred_idx, float(strength), cf_rgb)
         if best_partial is None or target_conf > best_partial[1][target_class]:
@@ -734,7 +744,8 @@ def choose_semantic_counterfactual(
     cf_tensor, probs, pred_idx, strength, cf_rgb = best_partial
     refined_tensor, refined_probs, refined_pred = refine_with_gradient(
         model, cf_tensor.detach().clone(), mask_tensor, target_class,
-        device, decision_threshold,
+        device, decision_threshold, steps=steps, lr=lr,
+        delta_resolution=delta_resolution, tv_weight=tv_weight, l1_weight=l1_weight,
     )
     if refined_pred == target_class:
         cf_rgb = tensor_to_display(refined_tensor)
@@ -783,7 +794,7 @@ def change_localisation_metrics(diff_gray, lung_mask, threshold=0.02):
 
 def make_descriptive_stem(row, idx):
     true_label = row["true_label"].lower()
-    target_label = "pneumonia" if row["pred_idx"] == 0 else "normal"
+    target_label = "pneumonia" if row["true_idx"] == 0 else "normal"
     return f"{idx + 1:02d}_{true_label}_xray", target_label
 
 
@@ -1100,17 +1111,17 @@ def parse_args():
                         help="Optimisation steps per image.")
     parser.add_argument("--lr", type=float, default=0.01,
                         help="Learning rate for the perturbation.")
-    parser.add_argument("--l1-weight", type=float, default=0.004,
+    parser.add_argument("--l1-weight", type=float, default=0.04,
                         help="L1 sparsity penalty on the perturbation.")
-    parser.add_argument("--tv-weight", type=float, default=0.02,
+    parser.add_argument("--tv-weight", type=float, default=0.3,
                         help="Total-variation smoothness penalty.")
     parser.add_argument("--confidence-threshold", type=float, default=0.65,
                         help="Target-class probability to consider the CF successful.")
     parser.add_argument("--delta-limit", type=float, default=1.0,
                         help="Maximum optimized perturbation in normalized image space.")
-    parser.add_argument("--effect-strength", type=float, default=3.0,
+    parser.add_argument("--effect-strength", type=float, default=1.0,
                         help="Amplifies the learned perturbation in saved counterfactual images.")
-    parser.add_argument("--delta-resolution", type=int, default=56,
+    parser.add_argument("--delta-resolution", type=int, default=16,
                         help="Lower values produce smoother, broader visual edits.")
     parser.add_argument("--pixel-counterfactual", action="store_true",
                         help="Use unconstrained optimized pixel perturbations instead of semantic grayscale edits.")
@@ -1182,7 +1193,7 @@ def main():
         )
         original_rgb = tensor_to_display(input_tensor)
 
-        source_class = row["pred_idx"]
+        source_class = row["true_idx"]
         target_class = 1 - source_class
 
         best_delta = None
@@ -1222,6 +1233,8 @@ def main():
                     model, original_rgb, mask_np, target_class, device,
                     decision_threshold, args.semantic_strength, seed,
                     input_tensor=input_tensor,
+                    steps=args.steps, lr=args.lr, delta_resolution=args.delta_resolution,
+                    tv_weight=args.tv_weight, l1_weight=args.l1_weight,
                 )
                 cf_target_prob = float(cf_probs[target_class])
             cf_confidence = float(cf_probs[cf_pred_idx])
