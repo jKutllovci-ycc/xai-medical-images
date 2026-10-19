@@ -12,6 +12,8 @@ What it does:
     - For Counterfactuals: SSIM (structural similarity to original), L1 distance,
       perturbation sparsity, prediction flip success rate
     - For Guided Counterfactuals: same metrics plus comparison to standard CFs
+    - For GAN Counterfactuals: the same image-change and lung-localisation audit,
+      reported overall and separately for both generation directions
     - These metrics answer: "Is the model actually using the regions the explanation
       highlights?" and "Are the counterfactual changes minimal and realistic?"
     - Saves metrics to JSON and generates comparison bar charts
@@ -20,6 +22,7 @@ What it does:
 import json
 import os
 import argparse
+import csv
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(".matplotlib-cache").resolve()))
@@ -53,7 +56,8 @@ SPLIT_CSV = Path("data/processed/splits/stratified_split.csv")
 CHECKPOINT_PATH = Path("experiments/checkpoints/best_classifier.pt")
 RESULTS_DIR = Path("experiments/results")
 GRADCAM_DIR = Path("outputs/gradcam")
-CF_DIR = Path("outputs/counterfactuals")
+CF_DIR = Path("outputs/counterfactuals/classic")
+GAN_CF_DIR = Path("outputs/counterfactuals/gan")
 GUIDED_CF_DIR = Path("outputs/guided_counterfactuals")
 OUTPUT_DIR = Path("outputs/explanation_quality")
 SELECTED_CSV = Path("outputs/selected_examples.csv")
@@ -625,6 +629,44 @@ def evaluate_guided_counterfactuals(guided_dir):
     return results
 
 
+def evaluate_gan_counterfactuals(gan_dir):
+    metrics_path = gan_dir / "metrics.csv"
+    if not metrics_path.exists():
+        print(f"  GAN CF: metrics not found at {metrics_path}, skipping.")
+        return []
+
+    results = []
+    with open(metrics_path, newline="") as handle:
+        entries = list(csv.DictReader(handle))
+
+    for entry in entries:
+        source_path = Path(entry.get("source_path", ""))
+        case = int(entry.get("case", 0))
+        direction = entry.get("direction", "")
+        generated_path = gan_dir / f"case_{case:02d}_{direction.lower()}.png"
+        if not source_path.exists() or not generated_path.exists():
+            continue
+
+        original = load_display_image(source_path)
+        generated = np.asarray(
+            Image.open(generated_path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
+        ).astype(np.float32) / 255.0
+        lung_mask = make_lung_field_mask(original)
+        metrics = compute_counterfactual_metrics(original, generated, lung_mask)
+        results.append({
+            "case": case,
+            "file": source_path.name,
+            "source_path": str(source_path),
+            "direction": direction,
+            "success": entry.get("success", "").lower() == "true",
+            "target_probability_after": float(entry.get("target_probability_after", 0)),
+            "applied_strength": float(entry.get("applied_strength", 0)),
+            **metrics,
+        })
+
+    return results
+
+
 def save_fidelity_chart(gradcam_results, output_dir):
     if not gradcam_results:
         return
@@ -666,7 +708,7 @@ def save_fidelity_chart(gradcam_results, output_dir):
     plt.close(fig)
 
 
-def save_counterfactual_quality_chart(cf_results, guided_results, output_dir):
+def save_counterfactual_quality_chart(cf_results, guided_results, gan_results, output_dir):
     if not cf_results:
         return
 
@@ -676,7 +718,7 @@ def save_counterfactual_quality_chart(cf_results, guided_results, output_dir):
     cf_sparsity = [r["sparsity"] for r in cf_results]
     cf_l1 = [r["l1_distance"] for r in cf_results]
 
-    labels = ["Normal changed image"]
+    labels = ["Classic CF"]
     ssim_means = [np.mean(cf_ssim)]
     sparsity_means = [np.mean(cf_sparsity)]
     l1_means = [np.mean(cf_l1)]
@@ -685,12 +727,21 @@ def save_counterfactual_quality_chart(cf_results, guided_results, output_dir):
         g_ssim = [r["ssim"] for r in guided_results]
         g_sparsity = [r["sparsity"] for r in guided_results]
         g_l1 = [r["l1_distance"] for r in guided_results]
-        labels.append("Focused changed image")
+        labels.append("Guided CF")
         ssim_means.append(np.mean(g_ssim))
         sparsity_means.append(np.mean(g_sparsity))
         l1_means.append(np.mean(g_l1))
 
-    colors = ["#3b82f6", "#22c55e"][:len(labels)]
+    if gan_results:
+        gan_ssim = [r["ssim"] for r in gan_results]
+        gan_sparsity = [r["sparsity"] for r in gan_results]
+        gan_l1 = [r["l1_distance"] for r in gan_results]
+        labels.append("GAN CF")
+        ssim_means.append(np.mean(gan_ssim))
+        sparsity_means.append(np.mean(gan_sparsity))
+        l1_means.append(np.mean(gan_l1))
+
+    colors = ["#3b82f6", "#22c55e", "#f59e0b"][:len(labels)]
 
     axes[0].bar(labels, ssim_means, color=colors)
     axes[0].set_title(
@@ -724,13 +775,15 @@ def save_counterfactual_quality_chart(cf_results, guided_results, output_dir):
     plt.close(fig)
 
 
-def save_anatomical_plausibility_chart(gradcam_results, cf_results, guided_results, output_dir):
+def save_anatomical_plausibility_chart(
+    gradcam_results, cf_results, guided_results, gan_results, output_dir
+):
     labels = []
     inside_signal = []
     outside_active = []
 
     if gradcam_results:
-        labels.append("Model focus map")
+        labels.append("Grad-CAM++")
         inside_signal.append(np.mean([
             r["cam_signal_inside_lung_fraction"] for r in gradcam_results
         ]))
@@ -739,7 +792,7 @@ def save_anatomical_plausibility_chart(gradcam_results, cf_results, guided_resul
         ]))
 
     if cf_results:
-        labels.append("Normal changed image")
+        labels.append("Classic CF")
         inside_signal.append(np.mean([
             r["signal_inside_lung_fraction"] for r in cf_results
         ]))
@@ -748,12 +801,21 @@ def save_anatomical_plausibility_chart(gradcam_results, cf_results, guided_resul
         ]))
 
     if guided_results:
-        labels.append("Focused changed image")
+        labels.append("Guided CF")
         inside_signal.append(np.mean([
             r["signal_inside_lung_fraction"] for r in guided_results
         ]))
         outside_active.append(np.mean([
             r["active_outside_lung_fraction"] for r in guided_results
+        ]))
+
+    if gan_results:
+        labels.append("GAN CF")
+        inside_signal.append(np.mean([
+            r["signal_inside_lung_fraction"] for r in gan_results
+        ]))
+        outside_active.append(np.mean([
+            r["active_outside_lung_fraction"] for r in gan_results
         ]))
 
     if not labels:
@@ -878,11 +940,16 @@ def main():
     print("Evaluating guided counterfactual quality...")
     guided_results = evaluate_guided_counterfactuals(GUIDED_CF_DIR)
 
+    print("Evaluating GAN counterfactual quality...")
+    gan_results = evaluate_gan_counterfactuals(GAN_CF_DIR)
+
     save_fidelity_chart(gradcam_results, OUTPUT_DIR)
     save_insertion_deletion_curves(gradcam_results, OUTPUT_DIR)
-    save_counterfactual_quality_chart(cf_results, guided_results, OUTPUT_DIR)
+    save_counterfactual_quality_chart(
+        cf_results, guided_results, gan_results, OUTPUT_DIR,
+    )
     save_anatomical_plausibility_chart(
-        gradcam_results, cf_results, guided_results, OUTPUT_DIR,
+        gradcam_results, cf_results, guided_results, gan_results, OUTPUT_DIR,
     )
 
     summary = {
@@ -950,6 +1017,53 @@ def main():
             ) if guided_results else 0,
             "per_image": guided_results,
         },
+        "gan_counterfactual": {
+            "num_evaluated": len(gan_results),
+            "mean_ssim": round(float(np.mean(
+                [r["ssim"] for r in gan_results]
+            )), 4) if gan_results else 0,
+            "mean_l1": round(float(np.mean(
+                [r["l1_distance"] for r in gan_results]
+            )), 6) if gan_results else 0,
+            "mean_sparsity": round(float(np.mean(
+                [r["sparsity"] for r in gan_results]
+            )), 4) if gan_results else 0,
+            "mean_change_inside_lung_fraction": round(float(np.mean(
+                [r["signal_inside_lung_fraction"] for r in gan_results]
+            )), 4) if gan_results else 0,
+            "mean_active_change_outside_lung_fraction": round(float(np.mean(
+                [r["active_outside_lung_fraction"] for r in gan_results]
+            )), 4) if gan_results else 0,
+            "success_rate": round(
+                sum(1 for r in gan_results if r.get("success", False)) /
+                max(len(gan_results), 1), 4
+            ) if gan_results else 0,
+            "by_direction": {
+                direction: {
+                    "num_evaluated": len(direction_rows),
+                    "mean_ssim": round(float(np.mean(
+                        [r["ssim"] for r in direction_rows]
+                    )), 4),
+                    "mean_l1": round(float(np.mean(
+                        [r["l1_distance"] for r in direction_rows]
+                    )), 6),
+                    "mean_sparsity": round(float(np.mean(
+                        [r["sparsity"] for r in direction_rows]
+                    )), 4),
+                    "mean_change_inside_lung_fraction": round(float(np.mean(
+                        [r["signal_inside_lung_fraction"] for r in direction_rows]
+                    )), 4),
+                    "mean_active_change_outside_lung_fraction": round(float(np.mean(
+                        [r["active_outside_lung_fraction"] for r in direction_rows]
+                    )), 4),
+                }
+                for direction in sorted({r["direction"] for r in gan_results})
+                for direction_rows in [[
+                    r for r in gan_results if r["direction"] == direction
+                ]]
+            },
+            "per_image": gan_results,
+        },
     }
 
     with open(OUTPUT_DIR / "explanation_quality.json", "w") as f:
@@ -969,6 +1083,11 @@ def main():
               f"sparsity: {summary['guided_counterfactual']['mean_sparsity']:.4f}, "
               "change inside lung: "
               f"{summary['guided_counterfactual']['mean_change_inside_lung_fraction']:.4f}")
+    if gan_results:
+        print(f"  GAN CF SSIM: {summary['gan_counterfactual']['mean_ssim']:.4f}, "
+              f"sparsity: {summary['gan_counterfactual']['mean_sparsity']:.4f}, "
+              "change inside lung: "
+              f"{summary['gan_counterfactual']['mean_change_inside_lung_fraction']:.4f}")
     print("\nStep 8 outputs")
     print(f"  Output directory:              {OUTPUT_DIR}")
     print(f"  Quality metrics JSON:          {OUTPUT_DIR / 'explanation_quality.json'}")
