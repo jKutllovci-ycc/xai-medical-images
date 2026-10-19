@@ -37,7 +37,7 @@ IMG_SIZE = 224
 CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 
 GRADCAM_DIR = Path("outputs/gradcam")
-CF_DIR = Path("outputs/counterfactuals")
+CF_DIR = Path("outputs/counterfactuals/classic")
 COMP_DIR = Path("outputs/comparisons")
 GUIDED_CF_DIR = Path("outputs/guided_counterfactuals")
 QUALITY_DIR = Path("outputs/explanation_quality")
