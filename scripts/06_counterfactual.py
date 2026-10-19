@@ -18,6 +18,7 @@ import argparse
 import csv
 import json
 import os
+import random
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(".matplotlib-cache").resolve()))
@@ -32,6 +33,7 @@ import torch.nn.functional as F
 from PIL import Image
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from skimage.metrics import structural_similarity
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
 from tqdm import tqdm
@@ -48,13 +50,16 @@ NUM_CLASSES = 2
 DATA_DIR = Path("data/raw/chest_xray")
 SPLIT_CSV = Path("data/processed/splits/stratified_split.csv")
 CHECKPOINT_PATH = Path("experiments/checkpoints/best_classifier.pt")
-CF_OUTPUT_DIR = Path("outputs/counterfactuals")
+COUNTERFACTUAL_ROOT = Path("outputs/counterfactuals")
+CF_OUTPUT_DIR = COUNTERFACTUAL_ROOT / "classic"
 COMP_OUTPUT_DIR = Path("outputs/comparisons")
 SELECTED_CSV = Path("outputs/selected_examples.csv")
 DECISION_THRESHOLD_PATH = Path("experiments/results/decision_threshold.json")
 CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 NORMAL_REF_PATH = Path("experiments/results/normal_lung_reference.npz")
 PNEUMONIA_REF_PATH = Path("experiments/results/pneumonia_lung_reference.npz")
+GAN_CHECKPOINT_PATH = Path("experiments/checkpoints/best_gan_counterfactual.pt")
+GAN_OUTPUT_DIR = COUNTERFACTUAL_ROOT / "gan"
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -137,6 +142,105 @@ class ChestXRayDataset(Dataset):
     def __getitem__(self, idx):
         img = Image.open(self.samples[idx]).convert("RGB")
         return self.transform(img), self.labels[idx], str(self.samples[idx])
+
+
+class GANResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.ReflectionPad2d(1), nn.Conv2d(channels, channels, 3),
+            nn.InstanceNorm2d(channels), nn.ReLU(inplace=True),
+            nn.ReflectionPad2d(1), nn.Conv2d(channels, channels, 3),
+            nn.InstanceNorm2d(channels),
+        )
+
+    def forward(self, image):
+        return image + self.block(image)
+
+
+class GANGenerator(nn.Module):
+    """CycleGAN generator for one counterfactual direction."""
+
+    def __init__(self, base_channels=64, residual_blocks=6):
+        super().__init__()
+        layers = [
+            nn.ReflectionPad2d(3), nn.Conv2d(1, base_channels, 7),
+            nn.InstanceNorm2d(base_channels), nn.ReLU(inplace=True),
+        ]
+        channels = base_channels
+        for _ in range(2):
+            layers.extend([
+                nn.Conv2d(channels, channels * 2, 3, stride=2, padding=1),
+                nn.InstanceNorm2d(channels * 2), nn.ReLU(inplace=True),
+            ])
+            channels *= 2
+        layers.extend(GANResidualBlock(channels) for _ in range(residual_blocks))
+        for _ in range(2):
+            layers.extend([
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.ReflectionPad2d(1),
+                nn.Conv2d(channels, channels // 2, 3),
+                nn.InstanceNorm2d(channels // 2), nn.ReLU(inplace=True),
+            ])
+            channels //= 2
+        layers.extend([nn.ReflectionPad2d(3), nn.Conv2d(channels, 1, 7), nn.Tanh()])
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, image):
+        return self.model(image)
+
+
+class GANDiscriminator(nn.Module):
+    """PatchGAN discriminator for one chest X-ray class."""
+
+    def __init__(self, base_channels=64):
+        super().__init__()
+
+        def block(in_channels, out_channels, stride=2, normalise=True):
+            layers = [nn.Conv2d(in_channels, out_channels, 4, stride, 1)]
+            if normalise:
+                layers.append(nn.InstanceNorm2d(out_channels))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+
+        self.model = nn.Sequential(
+            *block(1, base_channels, normalise=False),
+            *block(base_channels, base_channels * 2),
+            *block(base_channels * 2, base_channels * 4),
+            *block(base_channels * 4, base_channels * 8, stride=1),
+            nn.Conv2d(base_channels * 8, 1, 4, padding=1),
+        )
+
+    def forward(self, image):
+        return self.model(image)
+
+
+class UnpairedGANDataset(Dataset):
+    """Independent NORMAL and PNEUMONIA images from the training split only."""
+
+    def __init__(self, split_csv, image_size):
+        paths = {name: [] for name in CLASS_NAMES}
+        with open(split_csv, newline="") as handle:
+            for row in csv.DictReader(handle):
+                if row["split"] == "train" and row["class"] in paths:
+                    paths[row["class"]].append(Path(row["path"]))
+        self.normal = paths["NORMAL"]
+        self.pneumonia = paths["PNEUMONIA"]
+        if not self.normal or not self.pneumonia:
+            raise ValueError("The GAN requires both classes in the training split.")
+        self.transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.RandomAffine(5, translate=(0.02, 0.02)),
+            transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,)),
+        ])
+
+    def __len__(self):
+        return max(len(self.normal), len(self.pneumonia))
+
+    def __getitem__(self, index):
+        normal = Image.open(self.normal[index % len(self.normal)]).convert("L")
+        pneumonia = Image.open(random.choice(self.pneumonia)).convert("L")
+        return self.transform(normal), self.transform(pneumonia)
 
 
 def get_device():
@@ -1101,6 +1205,298 @@ def write_metadata(results, all_rows, cf_dir, comp_dir, args):
             writer.writerow({name: r.get(name) for name in fieldnames})
 
 
+def initialise_gan_weights(module):
+    if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
+        nn.init.normal_(module.weight, 0.0, 0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+
+def gan_to_classifier_input(images):
+    images = F.interpolate((images + 1.0) / 2.0, size=(IMG_SIZE, IMG_SIZE),
+                           mode="bilinear", align_corners=False)
+    images = images.repeat(1, 3, 1, 1)
+    mean = images.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    std = images.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    return (images - mean) / std
+
+
+def gan_discriminator_loss(discriminator, real, fake, criterion):
+    real_score = discriminator(real)
+    fake_score = discriminator(fake.detach())
+    return 0.5 * (
+        criterion(real_score, torch.ones_like(real_score)) +
+        criterion(fake_score, torch.zeros_like(fake_score))
+    )
+
+
+def train_gan_counterfactual(model, device, args):
+    """Train both CycleGAN directions without using validation or test images."""
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    dataset = UnpairedGANDataset(SPLIT_CSV, args.gan_image_size)
+    loader = DataLoader(dataset, batch_size=args.gan_batch_size, shuffle=True,
+                        num_workers=0)
+    g_n2p = GANGenerator(args.gan_channels, args.gan_blocks).to(device)
+    g_p2n = GANGenerator(args.gan_channels, args.gan_blocks).to(device)
+    d_normal = GANDiscriminator(args.gan_channels).to(device)
+    d_pneumonia = GANDiscriminator(args.gan_channels).to(device)
+    gan_models = {
+        "g_n2p": g_n2p, "g_p2n": g_p2n,
+        "d_normal": d_normal, "d_pneumonia": d_pneumonia,
+    }
+    for gan_model in gan_models.values():
+        gan_model.apply(initialise_gan_weights)
+
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    generator_optimizer = torch.optim.Adam(
+        list(g_n2p.parameters()) + list(g_p2n.parameters()),
+        lr=args.gan_lr, betas=(0.5, 0.999),
+    )
+    discriminator_optimizer = torch.optim.Adam(
+        list(d_normal.parameters()) + list(d_pneumonia.parameters()),
+        lr=args.gan_lr, betas=(0.5, 0.999),
+    )
+    mse, l1, cross_entropy = nn.MSELoss(), nn.L1Loss(), nn.CrossEntropyLoss()
+    history = {key: [] for key in
+               ("generator", "discriminator", "cycle", "identity", "classifier")}
+    best_score = float("inf")
+    global_step = 0
+    GAN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    GAN_CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    stop = False
+    for epoch in range(1, args.gan_epochs + 1):
+        totals = {key: 0.0 for key in history}
+        batches = 0
+        for normal, pneumonia in tqdm(loader, desc=f"GAN epoch {epoch}/{args.gan_epochs}"):
+            normal, pneumonia = normal.to(device), pneumonia.to(device)
+            generator_optimizer.zero_grad()
+            fake_pneumonia = g_n2p(normal)
+            fake_normal = g_p2n(pneumonia)
+            p_score = d_pneumonia(fake_pneumonia)
+            n_score = d_normal(fake_normal)
+            adversarial = (mse(p_score, torch.ones_like(p_score)) +
+                           mse(n_score, torch.ones_like(n_score)))
+            cycle = l1(g_p2n(fake_pneumonia), normal) + l1(g_n2p(fake_normal), pneumonia)
+            identity = l1(g_p2n(normal), normal) + l1(g_n2p(pneumonia), pneumonia)
+            classifier_loss = (
+                cross_entropy(
+                    model(gan_to_classifier_input(fake_pneumonia)),
+                    torch.ones(normal.size(0), dtype=torch.long, device=device),
+                ) +
+                cross_entropy(
+                    model(gan_to_classifier_input(fake_normal)),
+                    torch.zeros(normal.size(0), dtype=torch.long, device=device),
+                )
+            )
+            generator_loss = (adversarial + args.gan_cycle_weight * cycle +
+                              args.gan_identity_weight * identity +
+                              args.gan_classifier_weight * classifier_loss)
+            generator_loss.backward()
+            generator_optimizer.step()
+
+            discriminator_optimizer.zero_grad()
+            discriminator_loss = (
+                gan_discriminator_loss(d_normal, normal, fake_normal, mse) +
+                gan_discriminator_loss(d_pneumonia, pneumonia, fake_pneumonia, mse)
+            )
+            discriminator_loss.backward()
+            discriminator_optimizer.step()
+
+            values = {
+                "generator": generator_loss, "discriminator": discriminator_loss,
+                "cycle": cycle, "identity": identity, "classifier": classifier_loss,
+            }
+            for key, value in values.items():
+                totals[key] += float(value.detach().cpu())
+            batches += 1
+            global_step += 1
+            if args.gan_max_steps and global_step >= args.gan_max_steps:
+                stop = True
+                break
+
+        means = {key: totals[key] / max(batches, 1) for key in totals}
+        for key, value in means.items():
+            history[key].append(value)
+        proxy = means["cycle"] + means["classifier"]
+        if proxy < best_score:
+            best_score = proxy
+            torch.save({
+                "model_state_dicts": {
+                    name: gan_model.state_dict() for name, gan_model in gan_models.items()
+                },
+                "epoch": epoch, "step": global_step, "training_proxy": proxy,
+                "config": {
+                    "image_size": args.gan_image_size,
+                    "base_channels": args.gan_channels,
+                    "residual_blocks": args.gan_blocks,
+                    "method": "unpaired classifier-guided CycleGAN",
+                    "training_split_only": True,
+                },
+            }, GAN_CHECKPOINT_PATH)
+        with open(GAN_OUTPUT_DIR / "training_history.json", "w") as handle:
+            json.dump(history, handle, indent=2)
+        print(" | ".join(f"{key}={value:.4f}" for key, value in means.items()))
+        if stop:
+            break
+
+    figure, axis = plt.subplots(figsize=(9, 5))
+    for key, values in history.items():
+        axis.plot(values, label=key.title())
+    axis.set_xlabel("Epoch")
+    axis.set_ylabel("Mean loss")
+    axis.set_title("Classifier-guided CycleGAN training")
+    axis.legend()
+    figure.tight_layout()
+    figure.savefig(GAN_OUTPUT_DIR / "training_curves.png", dpi=160)
+    plt.close(figure)
+
+
+def load_gan_generators(device):
+    checkpoint = torch.load(GAN_CHECKPOINT_PATH, map_location=device, weights_only=True)
+    config = checkpoint["config"]
+    generators = {
+        "g_n2p": GANGenerator(config["base_channels"], config["residual_blocks"]).to(device),
+        "g_p2n": GANGenerator(config["base_channels"], config["residual_blocks"]).to(device),
+    }
+    for name, generator in generators.items():
+        generator.load_state_dict(checkpoint["model_state_dicts"][name])
+        generator.eval()
+    return generators, int(config["image_size"])
+
+
+def generate_gan_counterfactuals(model, selected, device, decision_threshold):
+    generators, training_size = load_gan_generators(device)
+    inference_size = IMG_SIZE
+    gan_transform = transforms.Compose([
+        transforms.Resize((training_size, training_size)), transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,)),
+    ])
+    display_transform = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)), transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,)),
+    ])
+    GAN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    rows = []
+    grid_items = []
+    for index, row in enumerate(tqdm(selected, desc="Generating GAN counterfactuals"), 1):
+        source = int(row["true_idx"])
+        target = 1 - source
+        source_image = Image.open(row["path"]).convert("L")
+        source_tensor = gan_transform(source_image).unsqueeze(0).to(device)
+        display_source = display_transform(source_image).unsqueeze(0).to(device)
+        generator = generators["g_n2p" if source == 0 else "g_p2n"]
+        with torch.no_grad():
+            generated_low_resolution = generator(source_tensor)
+            # Apply the learned GAN change to the original-size source. This keeps
+            # fine anatomical detail that would otherwise be lost by rebuilding
+            # the complete image from the lower GAN training resolution.
+            learned_change = generated_low_resolution - source_tensor
+            learned_change = F.interpolate(
+                learned_change, size=(inference_size, inference_size),
+                mode="bicubic", align_corners=False,
+            )
+            before = F.softmax(model(gan_to_classifier_input(display_source)), dim=1)[0]
+            generated_tensor = (display_source + learned_change).clamp(-1, 1)
+            after = F.softmax(model(gan_to_classifier_input(generated_tensor)), dim=1)[0]
+            applied_strength = 1.0
+            # Retain as much source detail as possible by choosing the smallest
+            # GAN change that crosses the saved classifier decision threshold.
+            for strength in torch.linspace(0.05, 1.0, 20, device=device):
+                candidate = (display_source + strength * learned_change).clamp(-1, 1)
+                candidate_probs = F.softmax(
+                    model(gan_to_classifier_input(candidate)), dim=1
+                )[0]
+                candidate_prediction = int(
+                    float(candidate_probs[1]) >= decision_threshold
+                )
+                if candidate_prediction == target:
+                    generated_tensor = candidate
+                    after = candidate_probs
+                    applied_strength = float(strength)
+                    break
+        original = ((display_source[0, 0].cpu().numpy() + 1) / 2).clip(0, 1)
+        generated = ((generated_tensor[0, 0].cpu().numpy() + 1) / 2).clip(0, 1)
+        difference = np.abs(generated - original)
+        prediction = int(float(after[1]) >= decision_threshold)
+        direction = f"{CLASS_NAMES[source]}_to_{CLASS_NAMES[target]}"
+        stem = f"case_{index:02d}_{direction.lower()}"
+        Image.fromarray((generated * 255).astype(np.uint8)).save(
+            GAN_OUTPUT_DIR / f"{stem}.png"
+        )
+        figure, axes = plt.subplots(1, 3, figsize=(12, 4))
+        for axis, image, title, cmap in zip(
+            axes, (original, generated, difference),
+            ("Original", "GAN counterfactual", "Absolute change"),
+            ("gray", "gray", "magma"),
+        ):
+            axis.imshow(image, cmap=cmap)
+            axis.set_title(title)
+            axis.axis("off")
+        figure.suptitle(
+            f"{direction.replace('_', ' ')} | target probability {float(after[target]):.3f}"
+        )
+        figure.tight_layout()
+        figure.savefig(GAN_OUTPUT_DIR / f"{stem}_comparison.png", dpi=180)
+        plt.close(figure)
+        rows.append({
+            "case": index, "source_path": row["path"], "direction": direction,
+            "source_probability_before": float(before[source]),
+            "target_probability_before": float(before[target]),
+            "target_probability_after": float(after[target]),
+            "prediction_after": CLASS_NAMES[prediction],
+            "success": prediction == target,
+            "applied_strength": applied_strength,
+            "ssim": float(structural_similarity(original, generated, data_range=1.0)),
+            "mean_absolute_change": float(difference.mean()),
+        })
+        grid_items.append((index, direction, original, generated))
+
+    for source_class, filename in (
+        (0, "normal_to_pneumonia_grid.png"),
+        (1, "pneumonia_to_normal_grid.png"),
+    ):
+        items = [item for item in grid_items
+                 if selected[item[0] - 1]["true_idx"] == source_class]
+        figure, axes = plt.subplots(3, 4, figsize=(12, 9))
+        for row_index, (case, direction, original, generated) in enumerate(items):
+            pair_axes = axes[row_index // 2, (row_index % 2) * 2:(row_index % 2) * 2 + 2]
+            for axis, image, title in zip(
+                pair_axes, (original, generated),
+                (f"Case {case:02d} source", "GAN output"),
+            ):
+                axis.imshow(image, cmap="gray", vmin=0, vmax=1)
+                axis.set_title(title)
+                axis.axis("off")
+        figure.suptitle(items[0][1].replace("_", " "))
+        figure.tight_layout()
+        figure.savefig(GAN_OUTPUT_DIR / filename, dpi=180, bbox_inches="tight")
+        plt.close(figure)
+
+    with open(GAN_OUTPUT_DIR / "metrics.csv", "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    summary = {
+        "cases": len(rows),
+        "training_image_size": training_size,
+        "generated_image_size": inference_size,
+        "successes": sum(row["success"] for row in rows),
+        "success_rate": sum(row["success"] for row in rows) / max(len(rows), 1),
+        "mean_ssim": float(np.mean([row["ssim"] for row in rows])),
+        "mean_absolute_change": float(np.mean([row["mean_absolute_change"] for row in rows])),
+        "warning": "GAN counterfactuals are model explanations, not clinical simulations.",
+    }
+    with open(GAN_OUTPUT_DIR / "summary.json", "w") as handle:
+        json.dump(summary, handle, indent=2)
+    print(f"GAN outputs: {GAN_OUTPUT_DIR}")
+    print(json.dumps(summary, indent=2))
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate counterfactual explanations for the pneumonia classifier."
@@ -1131,11 +1527,27 @@ def parse_args():
                         help="Keep old output files.")
     parser.add_argument("--reselect", action="store_true",
                         help="Force a new shared selected_examples.csv for all XAI steps.")
+    parser.add_argument("--gan", action="store_true",
+                        help="Also train/load CycleGAN and create GAN counterfactuals.")
+    parser.add_argument("--gan-retrain", action="store_true",
+                        help="Retrain the GAN even when its checkpoint already exists.")
+    parser.add_argument("--gan-epochs", type=int, default=5)
+    parser.add_argument("--gan-batch-size", type=int, default=8)
+    parser.add_argument("--gan-image-size", type=int, default=128)
+    parser.add_argument("--gan-channels", type=int, default=16)
+    parser.add_argument("--gan-blocks", type=int, default=3)
+    parser.add_argument("--gan-lr", type=float, default=0.0002)
+    parser.add_argument("--gan-cycle-weight", type=float, default=10.0)
+    parser.add_argument("--gan-identity-weight", type=float, default=5.0)
+    parser.add_argument("--gan-classifier-weight", type=float, default=1.0)
+    parser.add_argument("--gan-max-steps", type=int, default=0,
+                        help="GAN smoke-test limit; 0 uses all configured epochs.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    COUNTERFACTUAL_ROOT.mkdir(parents=True, exist_ok=True)
     CF_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     COMP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1144,6 +1556,10 @@ def main():
             for path in d.glob("*"):
                 if path.is_file():
                     path.unlink()
+        # Remove legacy flat files now that stage 6 has classic/ and gan/ branches.
+        for path in COUNTERFACTUAL_ROOT.glob("*"):
+            if path.is_file():
+                path.unlink()
 
     device = get_device()
     print(f"Using device: {device}")
@@ -1312,6 +1728,16 @@ def main():
             print(
                 f"    - {r['file']}: target_prob reached {r['cf_target_prob']:.3f}"
             )
+
+    if args.gan:
+        if args.gan_retrain or not GAN_CHECKPOINT_PATH.exists():
+            print("\nTraining the GAN counterfactual method inside stage 6...")
+            train_gan_counterfactual(model, device, args)
+        else:
+            print(f"\nUsing existing GAN checkpoint: {GAN_CHECKPOINT_PATH}")
+        generate_gan_counterfactuals(
+            model, selected, device, decision_threshold
+        )
 
 
 if __name__ == "__main__":
