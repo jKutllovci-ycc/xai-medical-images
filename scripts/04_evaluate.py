@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
 from tqdm import tqdm
 
+# Evaluation uses the same image size, model head, split, and preprocessing as training.
 IMG_SIZE = 224
 BATCH_SIZE = 32
 NUM_WORKERS = 4
@@ -155,6 +156,8 @@ def collect_probs(model, loader, device, desc):
 
 
 def choose_threshold(labels, pneumonia_probs, mode="specificity", target_specificity=0.99):
+    # Choose the decision threshold on validation data only; the saved result is 0.825.
+    # Decision-threshold calibration
     thresholds = np.linspace(0.05, 0.95, 181)
     scored = []
     for threshold in thresholds:
@@ -201,6 +204,8 @@ def parse_args():
 
 
 def main():
+    # Run the untouched test set once and save metrics, confusion matrix, and ROC curve.
+    # Held-out test evaluation
     args = parse_args()
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
