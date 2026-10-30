@@ -1,0 +1,11 @@
+{
+  "accuracy": 0.8830128205128205,
+  "precision": 0.8483516483516483,
+  "recall": 0.9897435897435898,
+  "f1_score": 0.9136094674556213,
+  "auc_roc": 0.88310322156476,
+  "specificity": 0.7051282051282052,
+  "balanced_accuracy": 0.8474358974358975,
+  "preprocess_mode": "baseline",
+  "decision_threshold": 0.825
+}

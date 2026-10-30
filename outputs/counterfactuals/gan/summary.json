@@ -1,0 +1,10 @@
+{
+  "cases": 12,
+  "training_image_size": 128,
+  "generated_image_size": 224,
+  "successes": 12,
+  "success_rate": 1.0,
+  "mean_ssim": 0.8943938010594547,
+  "mean_absolute_change": 0.03149248892441392,
+  "warning": "GAN counterfactuals are model explanations, not clinical simulations."
+}

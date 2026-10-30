@@ -1,0 +1,12 @@
+{
+  "decision_threshold": 0.825,
+  "chosen_on": "validation split",
+  "threshold_mode": "specificity",
+  "target_specificity": 0.99,
+  "reason": "Requires stronger pneumonia evidence so NORMAL chest X-rays are less often called PNEUMONIA.",
+  "validation_balanced_accuracy": 0.967982267982268,
+  "validation_specificity": 0.9925925925925926,
+  "validation_recall": 0.9433719433719434,
+  "preprocess_mode": "baseline",
+  "checkpoint_epoch": 2
+}

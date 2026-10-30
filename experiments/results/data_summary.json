@@ -1,0 +1,95 @@
+{
+  "train": {
+    "NORMAL": 1341,
+    "PNEUMONIA": 3875,
+    "total": 5216,
+    "pneumonia_percent": 74.29
+  },
+  "val": {
+    "NORMAL": 8,
+    "PNEUMONIA": 8,
+    "total": 16,
+    "pneumonia_percent": 50.0
+  },
+  "test": {
+    "NORMAL": 234,
+    "PNEUMONIA": 390,
+    "total": 624,
+    "pneumonia_percent": 62.5
+  },
+  "image_stats": {
+    "width_min": 384,
+    "width_max": 2916,
+    "width_mean": 1327.88,
+    "height_min": 127,
+    "height_max": 2713,
+    "height_mean": 970.69,
+    "mean_intensity": 124.0813,
+    "std_intensity": 57.2413,
+    "sample_count": 5856
+  },
+  "pixel_intensity_by_split_class": {
+    "train": {
+      "NORMAL": {
+        "image_count": 1341,
+        "mean_intensity_mean": 122.3836,
+        "mean_intensity_std": 12.9505,
+        "std_intensity_mean": 61.1593,
+        "std_intensity_std": 5.6062
+      },
+      "PNEUMONIA": {
+        "image_count": 3875,
+        "mean_intensity_mean": 125.1274,
+        "mean_intensity_std": 22.0826,
+        "std_intensity_mean": 55.848,
+        "std_intensity_std": 9.5161
+      }
+    },
+    "val": {
+      "NORMAL": {
+        "image_count": 8,
+        "mean_intensity_mean": 123.7724,
+        "mean_intensity_std": 23.4135,
+        "std_intensity_mean": 64.3543,
+        "std_intensity_std": 5.0426
+      },
+      "PNEUMONIA": {
+        "image_count": 8,
+        "mean_intensity_mean": 126.1158,
+        "mean_intensity_std": 16.3082,
+        "std_intensity_mean": 58.7959,
+        "std_intensity_std": 6.942
+      }
+    },
+    "test": {
+      "NORMAL": {
+        "image_count": 234,
+        "mean_intensity_mean": 124.2635,
+        "mean_intensity_std": 15.9127,
+        "std_intensity_mean": 60.0013,
+        "std_intensity_std": 6.7071
+      },
+      "PNEUMONIA": {
+        "image_count": 390,
+        "mean_intensity_mean": 119.3805,
+        "mean_intensity_std": 17.2205,
+        "std_intensity_mean": 55.7792,
+        "std_intensity_std": 8.5286
+      }
+    }
+  },
+  "data_quality": {
+    "bad_image_count": 0,
+    "duplicate_content_hash_count": 30,
+    "duplicate_file_count": 62
+  },
+  "training_recommendations": {
+    "train_class_weights": {
+      "NORMAL": 1.9448173005219984,
+      "PNEUMONIA": 0.6730322580645162
+    },
+    "avoid_horizontal_flip": true,
+    "reason": "Chest X-rays include laterality markers and asymmetric anatomy; flips can encourage shortcuts.",
+    "validation_warning": "Validation split has only 16 images; prefer balanced accuracy and confirm every checkpoint on the held-out test set."
+  }
+}
