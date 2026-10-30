@@ -52,6 +52,7 @@ OUTPUT_DIR = Path("outputs/gradcam")
 SELECTED_CSV = Path("outputs/selected_examples.csv")
 DECISION_THRESHOLD_PATH = Path("experiments/results/decision_threshold.json")
 CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
+# Grad-CAM++ is the saved method and layer4 is the final convolutional feature block.
 METHODS = {
     "gradcam": GradCAM,
     "gradcam++": GradCAMPlusPlus,
@@ -198,6 +199,7 @@ def score_test_set(model, dataset, device, decision_threshold):
 
 
 def select_examples(rows, max_per_class):
+    # Select six correct normal and six correct pneumonia cases for every explanation method.
     selected = []
     seen = set()
 
@@ -277,6 +279,8 @@ def resolve_selected_examples(all_rows, selected_csv, max_per_class, force_resel
 
 
 def make_lung_field_mask(rgb):
+    # This automatic mask keeps the display near the chest; it is not a clinical lung segmentation.
+    # Approximate chest-field mask
     """Approximate lung fields from dark aerated regions, then expand to cover opacities."""
     gray = (rgb.mean(axis=2) * 255).astype(np.uint8)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -608,6 +612,8 @@ def parse_args():
 
 
 def main():
+    # Generate heatmaps, overlays, per-image panels, summary grids, and metadata.
+    # Grad-CAM generation and export
     args = parse_args()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     if not args.no_clean:
