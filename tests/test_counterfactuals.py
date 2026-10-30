@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 
+# Load a numbered pipeline script.
 def load_script(name):
     path = Path(__file__).resolve().parents[1] / "scripts" / name
     spec = importlib.util.spec_from_file_location(path.stem, path)
@@ -19,6 +20,7 @@ cf = load_script("06_counterfactual.py")
 export = load_script("10_export_clear_counterfactuals.py")
 
 
+# Small model with easy-to-check scores.
 class BrightnessClassifier(torch.nn.Module):
     def forward(self, x):
         brightness = x.mean(dim=(1, 2, 3))
@@ -26,6 +28,7 @@ class BrightnessClassifier(torch.nn.Module):
 
 
 class CounterfactualTests(unittest.TestCase):
+    # GAN checks
     def test_gan_models_preserve_image_shape_and_bounds(self):
         generator = cf.GANGenerator(base_channels=8, residual_blocks=1)
         discriminator = cf.GANDiscriminator(base_channels=8)
@@ -42,6 +45,7 @@ class CounterfactualTests(unittest.TestCase):
         converted = cf.gan_to_classifier_input(source)
         self.assertEqual(converted.shape, (2, 3, 224, 224))
 
+    # Image edit check
     def test_pneumonia_opacity_is_visible_bounded_and_strength_dependent(self):
         original = np.full((224, 224, 3), 0.4, dtype=np.float32)
         mask = np.ones((224, 224), dtype=np.float32)
@@ -54,6 +58,7 @@ class CounterfactualTests(unittest.TestCase):
         protected = cf.semantic_edit(original, np.zeros_like(mask), 1, 12, 42)
         np.testing.assert_array_equal(protected, original)
 
+    # Example selection checks
     def test_gradcam_refreshes_cached_predictions_after_retraining(self):
         gradcam = load_script("05_gradcam.py")
         rows = [dict(path=f"example-{c}", true_idx=c, pred_idx=c,
@@ -77,6 +82,7 @@ class CounterfactualTests(unittest.TestCase):
         self.assertTrue(all(row["correct"] for row in selected))
         self.assertEqual({row["true_idx"] for row in selected}, {0, 1})
 
+    # Export checks
     def test_export_preserves_native_detail_with_zero_edit(self):
         native = np.random.default_rng(0).random((127, 193, 3), dtype=np.float32)
         original = np.full((224, 224, 3), 0.4, dtype=np.float32)
@@ -89,6 +95,7 @@ class CounterfactualTests(unittest.TestCase):
         self.assertEqual(result.shape, native.shape)
         np.testing.assert_allclose(result, 1)
 
+    # Standard and guided optimizer check
     def test_optimizer_returns_scored_snapshot_and_grayscale_change(self):
         for module in (cf, load_script("07_gradcam_guided_counterfactual.py")):
             with self.subTest(module=module.__name__):
