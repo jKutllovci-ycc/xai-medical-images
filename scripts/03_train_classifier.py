@@ -41,6 +41,7 @@ from torchvision import models, transforms
 from tqdm import tqdm
 
 # --- Config ---
+# These are the main training settings.
 IMG_SIZE = 224
 BATCH_SIZE = 32
 NUM_WORKERS = 4
@@ -75,6 +76,7 @@ def apply_image_preprocessing(image, mode="baseline"):
 
 
 class ChestXRayDataset(Dataset):
+    # Reads image paths and labels from the split CSV and loads images only when needed.
     def __init__(self, root_dir, split="train", transform=None, split_csv=None):
         self.root_dir = Path(root_dir)
         self.transform = transform
@@ -118,6 +120,7 @@ def get_device():
 
 
 def build_train_transform(preprocess_mode="baseline"):
+    # Training images receive small safe variations; horizontal flipping is not used.
     return transforms.Compose([
         transforms.Lambda(lambda img: apply_image_preprocessing(img, preprocess_mode)),
         transforms.Resize(256),
@@ -153,6 +156,7 @@ def seed_everything(seed):
 
 
 def make_balanced_sampler(labels):
+    # This sampler gives both classes a fair chance to appear in training batches.
     counts = np.bincount(labels, minlength=NUM_CLASSES)
     class_weights = 1.0 / np.maximum(counts, 1)
     sample_weights = [class_weights[label] for label in labels]
@@ -200,7 +204,8 @@ def parse_args():
                         help="Do not early-stop before this epoch (default: 15).")
     return parser.parse_args()
 
-
+   # Main training flow: data loaders, ResNet-18, loss, optimiser, validation, and saved checkpoint.
+   # Training pipeline
 def main():
     args = parse_args()
     seed_everything(SEED)
@@ -219,6 +224,7 @@ def main():
         print(f"Stratified split not found at {split_csv}; falling back to raw folders.")
         split_csv = None
 
+    # The training loader is balanced; the validation loader uses every image once.
     # --- DataLoaders ---
     train_dataset = ChestXRayDataset(DATA_DIR, "train", train_transform, split_csv=split_csv)
     val_dataset = ChestXRayDataset(DATA_DIR, "val", eval_transform, split_csv=split_csv)
@@ -233,6 +239,7 @@ def main():
             f"No images found under {DATA_DIR}. Run scripts/01_download_data.py first."
         )
 
+    # Balanced training data loader
     train_sampler = make_balanced_sampler(train_dataset.labels)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler,
                               num_workers=num_workers, pin_memory=pin_memory)
@@ -243,6 +250,7 @@ def main():
     print(f"Val class counts:   {val_dataset.class_counts()}")
     print("Augmentation: resize/crop, mild affine, mild contrast; no horizontal flip")
 
+    # Start from pretrained ResNet-18 and replace its last layer with two outputs.
     # --- Model ---
     model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
     in_features = model.fc.in_features
@@ -348,6 +356,8 @@ def main():
             f"F1: {val_metrics['f1']:.4f} | AUC: {val_metrics['auc']:.4f}"
         )
 
+        # Save the epoch with the best validation balanced accuracy, not simply the last epoch.
+        # Best-checkpoint selection
         improved = (
             val_metrics["balanced_acc"] > best_val_balanced_acc + 1e-4 or
             (abs(val_metrics["balanced_acc"] - best_val_balanced_acc) <= 1e-4 and
@@ -401,6 +411,7 @@ def main():
                     f"but continuing until min_epochs={args.min_epochs}"
                 )
 
+    # Save the numbers and curves used in the results notebook.
     # --- Save history ---
     with open(RESULTS_DIR / "training_history.json", "w") as f:
         json.dump(history, f, indent=2)
