@@ -13,7 +13,6 @@ wandb/
 .ipython/
 .cache/
 data/
-
 # Keep generated dissertation evidence in the repository.
 !outputs/
 !outputs/**
