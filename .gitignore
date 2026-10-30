@@ -14,7 +14,6 @@ wandb/
 .cache/
 data/
 experiments/experiment_log.md
-# Keep generated dissertation evidence in the repository.
 !outputs/
 !outputs/**
 !experiments/results/
