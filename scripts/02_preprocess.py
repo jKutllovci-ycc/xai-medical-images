@@ -31,6 +31,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+# These settings control the audit, output folders, image size, and repeatable seed.
 DATA_DIR = Path("data/raw/chest_xray")
 RESULTS_DIR = Path("experiments/results")
 SPLIT_DIR = Path("data/processed/splits")
@@ -78,7 +79,8 @@ def compute_class_weights(counts):
         for cls in CLASS_NAMES
     }
 
-
+ # Check every image and save one traceable row for it in the manifest.
+ # Image audit and manifest
 def build_manifest():
     rows = []
     bad_images = []
@@ -186,7 +188,8 @@ def save_manifest(rows):
         writer.writerows(rows)
     print(f"Saved: {path}")
 
-
+ # Rebuild the very small validation set, but keep the official test set unchanged.
+ # Reproducible train and validation split
 def build_stratified_split(rows, val_fraction=0.2, seed=SEED):
     rng = np.random.default_rng(seed)
     split_rows = []
@@ -260,6 +263,7 @@ def save_stratified_split(rows):
 
 
 def apply_clahe_preview(img):
+    # CLAHE improves local contrast. This is shown as a preview; the reported model uses baseline images.
     gray = np.asarray(img.convert("L"))
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return Image.fromarray(clahe.apply(gray))
@@ -342,6 +346,7 @@ def save_plots(rows, summary):
 
 
 def main():
+    # This main function runs the complete data audit and saves all plots and JSON/CSV results.
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     print("=" * 50)
