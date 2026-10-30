@@ -111,6 +111,8 @@ def load_resized(path):
 
 
 def compute_overlap(gradcam_path, diff_path):
+    # Measure how much the heatmap area and decision-changing area overlap.
+    # Grad-CAM and counterfactual overlap
     if gradcam_path is None or diff_path is None:
         return 0.0
     if not gradcam_path.exists() or not diff_path.exists():
@@ -437,6 +439,8 @@ def parse_args():
 
 
 def main():
+    # Match the same images, create side-by-side panels, and save the final comparison result.
+    # Final explanation comparison
     args = parse_args()
     if args.no_clean:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
