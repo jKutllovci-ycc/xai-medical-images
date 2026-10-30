@@ -145,6 +145,7 @@ class ChestXRayDataset(Dataset):
 
 
 class GANResidualBlock(nn.Module):
+    # This is one small building block used by the GAN generator.
     def __init__(self, channels):
         super().__init__()
         self.block = nn.Sequential(
@@ -159,6 +160,7 @@ class GANResidualBlock(nn.Module):
 
 
 class GANGenerator(nn.Module):
+    # The generator learns a normal-to-pneumonia or pneumonia-to-normal image change.
     """CycleGAN generator for one counterfactual direction."""
 
     def __init__(self, base_channels=64, residual_blocks=6):
@@ -191,6 +193,7 @@ class GANGenerator(nn.Module):
 
 
 class GANDiscriminator(nn.Module):
+    # The discriminator checks whether a generated target-class image looks like the training group.
     """PatchGAN discriminator for one chest X-ray class."""
 
     def __init__(self, base_channels=64):
@@ -479,6 +482,8 @@ def generate_counterfactual(
     device, steps, lr, l1_weight, tv_weight, confidence_threshold, delta_limit,
     delta_resolution,
 ):
+    # Keep the classifier frozen and optimise a small, smooth image change toward the opposite class.
+    # Pixel counterfactual optimization
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -650,6 +655,8 @@ def load_pneumonia_reference():
 
 def semantic_edit(original_rgb, lung_mask, target_class, strength, seed,
                   pneumonia_attention=None):
+    # Apply a different chest intensity pattern for normal-to-pneumonia and pneumonia-to-normal edits.
+    # Direction-specific semantic editing
     gray = original_rgb.mean(axis=2)
     mask = cv2.GaussianBlur(lung_mask.astype(np.float32), (0, 0), sigmaX=4)
     mask = np.clip(mask, 0, 1)
@@ -808,6 +815,7 @@ def choose_semantic_counterfactual(
     max_strength, seed, input_tensor=None,
     steps=500, lr=0.01, delta_resolution=16, tv_weight=0.3, l1_weight=0.04,
 ):
+    # Select an effective semantic counterfactual
     pneumonia_attention = None
     if target_class == 0 and input_tensor is not None:
         pneumonia_attention = compute_pneumonia_attention(model, input_tensor, device)
@@ -1231,6 +1239,7 @@ def gan_discriminator_loss(discriminator, real, fake, criterion):
 
 
 def train_gan_counterfactual(model, device, args):
+    # Train the optional unpaired GAN with cycle, identity, adversarial, and classifier losses.
     """Train both CycleGAN directions without using validation or test images."""
     random.seed(42)
     np.random.seed(42)
@@ -1546,6 +1555,8 @@ def parse_args():
 
 
 def main():
+    # Create standard counterfactuals first, then create GAN outputs when --gan is used.
+    # Counterfactual pipeline and optional GAN method
     args = parse_args()
     COUNTERFACTUAL_ROOT.mkdir(parents=True, exist_ok=True)
     CF_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
