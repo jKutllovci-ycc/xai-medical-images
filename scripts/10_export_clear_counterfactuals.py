@@ -23,6 +23,8 @@ OUTPUT = Path("outputs/clear_counterfactuals")
 
 
 def transfer_edit(native_rgb, model_original, model_cf):
+    # Resize only the learned change and add it to the original full-size image.
+    # Transfer the model-space edit to source resolution
     delta = (model_cf - model_original).mean(axis=2)
     native_delta = cv2.resize(delta, (native_rgb.shape[1], native_rgb.shape[0]),
                               interpolation=cv2.INTER_CUBIC)
@@ -30,6 +32,8 @@ def transfer_edit(native_rgb, model_original, model_cf):
 
 
 def main():
+    # Save clear PNG files, reopen them, and verify that every saved image still reaches its target.
+    # Export and verify saved counterfactual images
     OUTPUT.mkdir(parents=True, exist_ok=True)
     device = cf.get_device()
     model = cf.build_model(device)
