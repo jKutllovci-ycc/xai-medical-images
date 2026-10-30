@@ -351,6 +351,7 @@ def make_lung_field_mask(rgb):
 
 
 def compute_gradcam_mask(model, input_tensor, target_idx, device, cam_threshold=0.3):
+    # Turn the Grad-CAM heatmap into an editable attention region.
     previous_grad_state = [p.requires_grad for p in model.parameters()]
     try:
         for p in model.parameters():
@@ -375,6 +376,8 @@ def compute_gradcam_mask(model, input_tensor, target_idx, device, cam_threshold=
 
 
 def make_guided_mask(lung_mask, gradcam_mask, blend_weight=0.7):
+    # Combine model attention with the approximate chest mask to focus the edit.
+    # Grad-CAM-guided editing mask
     combined = lung_mask * (blend_weight * gradcam_mask + (1 - blend_weight))
     combined = cv2.GaussianBlur(combined, (5, 5), 0)
     return np.clip(combined, 0, 1).astype(np.float32)
@@ -811,6 +814,8 @@ def parse_args():
 
 
 def main():
+    # Make standard and guided edits for the same twelve images and compare their size and location.
+    # Standard and guided comparison
     args = parse_args()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     if not args.no_clean:
