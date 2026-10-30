@@ -409,10 +409,13 @@ def select_examples(rows, max_per_class):
 
 
 def insertion_deletion_test(model, input_tensor, cam, target_class, device, steps=20):
+    # Test whether adding or removing highlighted areas changes model confidence as expected.
     """
     Insertion: progressively reveal pixels from most to least important.
     Deletion: progressively remove pixels from most to least important.
     A faithful explanation should show: insertion raises confidence, deletion drops it.
+
+    This tests the heatmap against model behaviour instead of visual appearance.
     """
     model.eval()
     cam_flat = cam.flatten()
@@ -462,6 +465,8 @@ def insertion_deletion_test(model, input_tensor, cam, target_class, device, step
 
 
 def compute_counterfactual_metrics(original_rgb, cf_rgb, lung_mask=None):
+    # Measure similarity, change size, sparsity, success, and change inside/outside the chest.
+    # Counterfactual similarity and localization metrics
     ssim_val = ssim(
         original_rgb, cf_rgb,
         channel_axis=2,
@@ -902,6 +907,8 @@ def parse_args():
 
 
 def main():
+    # Evaluate Grad-CAM, standard, guided, and GAN explanations with the same code.
+    # Explanation-quality evaluation
     args = parse_args()
     if args.no_clean:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
