@@ -25,7 +25,7 @@ Usage:
     python run_pipeline.py                  # Run everything
     python run_pipeline.py --from 5         # Resume from step 5
     python run_pipeline.py --only 7 8       # Run only steps 7 and 8
-    python run_pipeline.py --skip 1         # Skip step 1 (data already downloaded)
+    python run_pipeline.py --skip 1         # Skip step 1 
     python run_pipeline.py --dry-run        # Show what would run without executing
 """
 
@@ -35,6 +35,7 @@ import sys
 import time
 from pathlib import Path
 
+# Pipeline stages and expected outputs
 STEPS = [
     {
         "num": 1,
@@ -75,8 +76,9 @@ STEPS = [
         "num": 6,
         "name": "Counterfactual Explanations",
         "script": "scripts/06_counterfactual.py",
-        "description": "Optimises perturbations that flip the model's diagnosis.",
-        "outputs": ["outputs/counterfactuals/", "outputs/comparisons/"],
+        "args": ["--gan"],
+        "description": "Creates normal and GAN counterfactuals in the same stage.",
+        "outputs": ["outputs/counterfactuals/classic/", "outputs/counterfactuals/gan/", "outputs/comparisons/"],
     },
     {
         "num": 7,
@@ -99,6 +101,13 @@ STEPS = [
         "description": "Side-by-side comparison with overlap analysis.",
         "outputs": ["outputs/gradcam_vs_counterfactual/"],
     },
+    {
+        "num": 10,
+        "name": "Clear Counterfactual Exports",
+        "script": "scripts/10_export_clear_counterfactuals.py",
+        "description": "Preserves source resolution and rechecks predictions on saved synthetic PNGs.",
+        "outputs": ["outputs/clear_counterfactuals/"],
+    },
 ]
 
 
@@ -113,17 +122,19 @@ def print_pipeline_overview():
     print("  MODEL      3. Train          →  4. Evaluate")
     print("                                       ↓")
     print("  EXPLAIN    5. Grad-CAM (baseline)")
-    print("             6. Counterfactual (main)")
+    print("             6. Counterfactual (normal + GAN)")
     print("             7. Guided CF (Grad-CAM + CF combined)")
     print("                                       ↓")
     print("  EVALUATE   8. Quality Metrics →  9. Compare Methods")
     print()
 
-
+ # Execute one pipeline stage
 def run_step(step, dry_run=False):
+    # This function runs one script and stops the pipeline if it fails.
     num = step["num"]
     name = step["name"]
     script = step["script"]
+    command = [sys.executable, script, *step.get("args", [])]
 
     print(f"\n{'─' * 60}")
     print(f"  STEP {num:2d} │ {name}")
@@ -134,7 +145,7 @@ def run_step(step, dry_run=False):
     print(f"{'─' * 60}")
 
     if dry_run:
-        print("  [DRY RUN] Would execute: python " + script)
+        print("  [DRY RUN] Would execute: " + " ".join(command))
         return True
 
     if not Path(script).exists():
@@ -142,7 +153,7 @@ def run_step(step, dry_run=False):
         return False
 
     start = time.time()
-    result = subprocess.run([sys.executable, script])
+    result = subprocess.run(command)
     elapsed = time.time() - start
 
     if result.returncode == 0:
@@ -172,6 +183,8 @@ def parse_args():
 
 
 def main():
+    # These options let me run all stages or restart from one stage.
+    # Select and run stages in order
     args = parse_args()
     print_pipeline_overview()
 
