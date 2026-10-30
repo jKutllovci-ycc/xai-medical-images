@@ -29,6 +29,8 @@ except ImportError as exc:
         "Install it with: python -m pip install -r requirements.txt"
     ) from exc
 
+# These are the temporary Kaggle folder and the one final dataset folder.
+# Dataset paths
 DATA_DIR = Path("data/raw").resolve()
 DOWNLOAD_DIR = DATA_DIR / "kaggle_download"
 FINAL_DIR = DATA_DIR / "chest_xray"
@@ -38,6 +40,8 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 print("Downloading Chest X-Ray Pneumonia dataset from Kaggle...")
+# Kaggle downloads one dataset, then this code finds and moves the real chest_xray folder.
+# Kaggle download and extraction
 api = KaggleApi()
 api.authenticate()
 api.dataset_download_files(DATASET, path=str(DOWNLOAD_DIR), unzip=True, quiet=False)
@@ -60,6 +64,7 @@ else:
     shutil.move(str(source_dir), str(FINAL_DIR))
     print(f"Moved dataset to: {FINAL_DIR}")
 
+# End by checking that every split and class exists and contains images.
 for split in ["train", "val", "test"]:
     for cls in ["NORMAL", "PNEUMONIA"]:
         cls_dir = FINAL_DIR / split / cls
